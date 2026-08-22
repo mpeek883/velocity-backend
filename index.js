@@ -4,7 +4,7 @@ const helmet = require('helmet');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 const { Pool } = require('pg');
-const FreeSourcesScraper = require('./scraper/free-sources-scraper');
+const FreeSourcesScraper = require('./free-sources-scraper');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
