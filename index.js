@@ -4,21 +4,18 @@ const helmet = require('helmet');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 const { Pool } = require('pg');
-const nodeFetch = require('node-fetch');
-const cheerio = require('cheerio');
+const FreeSourcesScraper = require('./free-sources-scraper');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 
 // ====== DATABASE CONNECTION ======
-// Use DATABASE_URL from Render environment
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
 
-// Test database connection on startup
 pool.query('SELECT NOW()', (err, result) => {
   if (err) {
     console.error('❌ Database connection error:', err.message);
@@ -55,8 +52,6 @@ app.get('/api/setup/init-db', async (req, res) => {
   try {
     console.log('🚀 Starting database initialization...');
 
-    // STEP 1: Drop existing tables to clean up old schemas
-    console.log('🧹 Dropping existing tables...');
     const dropSQL = `
       DROP TABLE IF EXISTS placements CASCADE;
       DROP TABLE IF EXISTS submissions CASCADE;
@@ -70,8 +65,6 @@ app.get('/api/setup/init-db', async (req, res) => {
     await pool.query(dropSQL);
     console.log('✅ Old tables dropped');
 
-    // STEP 2: Create fresh tables
-    console.log('🏗️ Creating new tables...');
     const createSQL = `
       CREATE TABLE users (
         id SERIAL PRIMARY KEY,
@@ -169,8 +162,6 @@ app.get('/api/setup/init-db', async (req, res) => {
     await pool.query(createSQL);
     console.log('✅ Tables created successfully!');
 
-    // STEP 3: Insert admin user
-    console.log('👤 Inserting admin user...');
     await pool.query(
       `INSERT INTO users (org_id, email, password_hash, name) 
        VALUES ($1, $2, $3, $4)`,
@@ -178,7 +169,6 @@ app.get('/api/setup/init-db', async (req, res) => {
     );
     console.log('✅ Admin user created');
 
-    // STEP 4: Verify
     const tablesResult = await pool.query(
       "SELECT table_name FROM information_schema.tables WHERE table_schema='public' ORDER BY table_name"
     );
@@ -211,8 +201,6 @@ app.get('/api/setup/init-db', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-
-    // Query database for user
     const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
 
     if (result.rows.length === 0) {
@@ -220,17 +208,13 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     const user = result.rows[0];
-
-    // Compare password with bcrypt hash
     const validPassword = await bcrypt.compare(password, user.password_hash);
 
     if (!validPassword) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    // Generate JWT token
     const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '24h' });
-
     res.json({ token, user: { id: user.id, email: user.email, name: user.name } });
   } catch (err) {
     console.error('Login error:', err);
@@ -239,8 +223,6 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // ====== CRUD ROUTES ======
-
-// CONTACTS
 app.get('/api/contacts', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM contacts ORDER BY created_at DESC');
@@ -425,45 +407,53 @@ app.post('/api/contracts', authenticateToken, async (req, res) => {
   }
 });
 
-// ====== FREE SOURCES ENDPOINT (PLACEHOLDER) ======
+// ====== FREE SOURCES CANDIDATE SCRAPING ======
+const scraper = new FreeSourcesScraper();
+
 app.post('/api/candidates/search/free-sources', authenticateToken, async (req, res) => {
   try {
     const { query, sources } = req.body;
-    
-    // Placeholder response - ready for scraper integration
-    const candidates = {
-      jobvertise: [],
-      craigslist: [],
-      wellfound: [],
-      postjobfree: [],
-      total: 0
-    };
+
+    if (!query || query.trim().length === 0) {
+      return res.status(400).json({ error: 'Query parameter is required' });
+    }
+
+    console.log(`\n🔍 Free Sources Search: "${query}"`);
+    const results = await scraper.searchCandidates(query, sources);
+
+    const candidatesList = [];
+    Object.entries(results.sources).forEach(([source, candidates]) => {
+      candidatesList.push(...candidates);
+    });
 
     res.json({
-      query,
-      sources: sources || ['jobvertise', 'craigslist', 'wellfound', 'postjobfree'],
-      candidates,
-      message: 'Free sources endpoint ready for integration'
+      success: true,
+      query: results.query,
+      totalFound: results.totalCandidates,
+      breakdown: results.breakdown,
+      candidates: candidatesList,
+      sources: Object.keys(results.sources),
+      scrapedAt: results.timestamp
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('❌ Free sources search error:', err);
+    res.status(500).json({ 
+      error: 'Free sources search failed',
+      message: err.message 
+    });
   }
 });
 
-// ====== APOLLO SEARCH ENDPOINT (PLACEHOLDER) ======
-app.post('/api/candidates/search', authenticateToken, async (req, res) => {
-  try {
-    const { query } = req.body;
-    
-    // Placeholder response - ready for Apollo integration
-    res.json({
-      query,
-      candidates: [],
-      message: 'Apollo search endpoint ready for integration'
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+app.get('/api/candidates/search/free-sources/status', (req, res) => {
+  res.json({
+    status: 'ready',
+    availableSources: ['jobvertise', 'craigslist', 'wellfound', 'postjobfree'],
+    endpoint: 'POST /api/candidates/search/free-sources',
+    example: {
+      query: 'javascript developer',
+      sources: ['jobvertise', 'craigslist', 'wellfound', 'postjobfree']
+    }
+  });
 });
 
 // ====== DASHBOARD ENDPOINT ======
@@ -509,6 +499,7 @@ app.listen(PORT, () => {
   console.log(`\n🚀 VelocityCRM Backend API listening on port ${PORT}`);
   console.log('📍 Environment:', process.env.NODE_ENV || 'development');
   console.log('🔐 Authentication: JWT enabled');
-  console.log('🔍 Free Sources: Ready for integration');
+  console.log('🔍 Free Sources Scraping: ENABLED ✨');
+  console.log('   - Jobvertise, Craigslist, Wellfound, PostJobFree');
   console.log('🛠️ Database Setup: GET /api/setup/init-db\n');
 });
