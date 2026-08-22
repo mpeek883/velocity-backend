@@ -55,9 +55,25 @@ app.get('/api/setup/init-db', async (req, res) => {
   try {
     console.log('🚀 Starting database initialization...');
 
-    const initSQL = `
-      -- VelocityCRM Database Schema Initialization
-      CREATE TABLE IF NOT EXISTS users (
+    // STEP 1: Drop existing tables to clean up old schemas
+    console.log('🧹 Dropping existing tables...');
+    const dropSQL = `
+      DROP TABLE IF EXISTS placements CASCADE;
+      DROP TABLE IF EXISTS submissions CASCADE;
+      DROP TABLE IF EXISTS contracts CASCADE;
+      DROP TABLE IF EXISTS job_orders CASCADE;
+      DROP TABLE IF EXISTS candidates CASCADE;
+      DROP TABLE IF EXISTS accounts CASCADE;
+      DROP TABLE IF EXISTS contacts CASCADE;
+      DROP TABLE IF EXISTS users CASCADE;
+    `;
+    await pool.query(dropSQL);
+    console.log('✅ Old tables dropped');
+
+    // STEP 2: Create fresh tables
+    console.log('🏗️ Creating new tables...');
+    const createSQL = `
+      CREATE TABLE users (
         id SERIAL PRIMARY KEY,
         org_id INTEGER,
         email VARCHAR(255) UNIQUE NOT NULL,
@@ -67,7 +83,7 @@ app.get('/api/setup/init-db', async (req, res) => {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
-      CREATE TABLE IF NOT EXISTS contacts (
+      CREATE TABLE contacts (
         id SERIAL PRIMARY KEY,
         name VARCHAR(255),
         email VARCHAR(255),
@@ -78,7 +94,7 @@ app.get('/api/setup/init-db', async (req, res) => {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
-      CREATE TABLE IF NOT EXISTS accounts (
+      CREATE TABLE accounts (
         id SERIAL PRIMARY KEY,
         name VARCHAR(255),
         industry VARCHAR(100),
@@ -89,7 +105,7 @@ app.get('/api/setup/init-db', async (req, res) => {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
-      CREATE TABLE IF NOT EXISTS candidates (
+      CREATE TABLE candidates (
         id SERIAL PRIMARY KEY,
         name VARCHAR(255),
         email VARCHAR(255),
@@ -103,7 +119,7 @@ app.get('/api/setup/init-db', async (req, res) => {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
-      CREATE TABLE IF NOT EXISTS job_orders (
+      CREATE TABLE job_orders (
         id SERIAL PRIMARY KEY,
         title VARCHAR(255),
         company VARCHAR(255),
@@ -116,7 +132,7 @@ app.get('/api/setup/init-db', async (req, res) => {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
-      CREATE TABLE IF NOT EXISTS submissions (
+      CREATE TABLE submissions (
         id SERIAL PRIMARY KEY,
         candidate_id INTEGER REFERENCES candidates(id),
         job_order_id INTEGER REFERENCES job_orders(id),
@@ -125,7 +141,7 @@ app.get('/api/setup/init-db', async (req, res) => {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
-      CREATE TABLE IF NOT EXISTS placements (
+      CREATE TABLE placements (
         id SERIAL PRIMARY KEY,
         submission_id INTEGER REFERENCES submissions(id),
         start_date DATE,
@@ -135,7 +151,7 @@ app.get('/api/setup/init-db', async (req, res) => {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
-      CREATE TABLE IF NOT EXISTS contracts (
+      CREATE TABLE contracts (
         id SERIAL PRIMARY KEY,
         account_id INTEGER REFERENCES accounts(id),
         type VARCHAR(50),
@@ -145,27 +161,29 @@ app.get('/api/setup/init-db', async (req, res) => {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
-      INSERT INTO users (org_id, email, password_hash, name)
-      VALUES (1, 'admin@peekenterprises.com', '$2b$10$YRLQ1f5PEFrJgey4ZYYmWe/1LZD0Q.xCIwsxEY0d3QwAwQBXx6QpG', 'Admin User')
-      ON CONFLICT (email) DO NOTHING;
-
-      CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
-      CREATE INDEX IF NOT EXISTS idx_candidates_email ON candidates(email);
-      CREATE INDEX IF NOT EXISTS idx_job_orders_status ON job_orders(status);
-      CREATE INDEX IF NOT EXISTS idx_submissions_status ON submissions(status);
+      CREATE INDEX idx_users_email ON users(email);
+      CREATE INDEX idx_candidates_email ON candidates(email);
+      CREATE INDEX idx_job_orders_status ON job_orders(status);
+      CREATE INDEX idx_submissions_status ON submissions(status);
     `;
+    await pool.query(createSQL);
+    console.log('✅ Tables created successfully!');
 
-    // Run initialization
-    await pool.query(initSQL);
-    console.log('✅ Tables and indexes created successfully!');
+    // STEP 3: Insert admin user
+    console.log('👤 Inserting admin user...');
+    await pool.query(
+      `INSERT INTO users (org_id, email, password_hash, name) 
+       VALUES ($1, $2, $3, $4)`,
+      [1, 'admin@peekenterprises.com', '$2b$10$YRLQ1f5PEFrJgey4ZYYmWe/1LZD0Q.xCIwsxEY0d3QwAwQBXx6QpG', 'Admin User']
+    );
+    console.log('✅ Admin user created');
 
-    // Verify tables
+    // STEP 4: Verify
     const tablesResult = await pool.query(
       "SELECT table_name FROM information_schema.tables WHERE table_schema='public' ORDER BY table_name"
     );
     const tables = tablesResult.rows.map(r => r.table_name);
 
-    // Verify admin user
     const userResult = await pool.query(
       "SELECT id, email, name FROM users WHERE email = 'admin@peekenterprises.com'"
     );
