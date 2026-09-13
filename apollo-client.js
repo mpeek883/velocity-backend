@@ -66,7 +66,8 @@ function createApolloClient({ apiKey = process.env.APOLLO_API_KEY, fetchImpl = g
     try { data = await res.json(); } catch { data = null; }
 
     if (res.status === 401 || res.status === 403) {
-      throw new ApolloError('Apollo rejected the API key (check APOLLO_API_KEY on Render)', { status: 502, code: 'APOLLO_AUTH' });
+      const detail = (data && (data.error || data.message)) ? `: ${data.error || data.message}` : '';
+      throw new ApolloError(`Apollo rejected the request (HTTP ${res.status}${detail}). Check that APOLLO_API_KEY on Render is a valid key with API access for this endpoint.`, { status: 502, code: 'APOLLO_AUTH' });
     }
     if (res.status === 429) {
       const retryAfter = Number(res.headers && res.headers.get && res.headers.get('retry-after')) || null;
