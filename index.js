@@ -65,7 +65,10 @@ function pickColumns(body, allowed) {
   for (const col of allowed) {
     if (body && Object.prototype.hasOwnProperty.call(body, col)) {
       cols.push(col);
-      vals.push(body[col] === '' ? null : body[col]);
+      const v = body[col];
+      // Arrays (e.g. a skills list from the app) go into TEXT columns as
+      // comma-separated text, not as a Postgres array literal like "{a,b}".
+      vals.push(v === '' ? null : Array.isArray(v) ? v.map((s) => String(s).trim()).filter(Boolean).join(', ') : v);
     }
   }
   return { cols, vals };
