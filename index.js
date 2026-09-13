@@ -11,6 +11,7 @@ const { extractCandidateWithAI, isAIConfigured } = require('./resume-ai');
 const { getApolloClient, isApolloConfigured, ApolloError } = require('./apollo-client');
 const { sendEmail, isEmailConfigured, emailTransportName, textToHtml, FROM_EMAIL } = require('./email');
 const { runAssistantChat, isAIConfigured: isAssistantConfigured } = require('./assistant');
+const { buildCandidateProfile, markdownToHtml, isProfileAIConfigured } = require('./candidate-profile');
 
 // Resume uploads are held in memory (never written to disk) and capped at 5 MB.
 const resumeUpload = multer({
@@ -46,6 +47,29 @@ async function ensureSchema() {
     "ALTER TABLE job_orders ADD COLUMN IF NOT EXISTS posted_at TIMESTAMP",
     "ALTER TABLE job_orders ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP",
     "ALTER TABLE job_orders ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMP",
+    // Candidate detail the Add Candidate form collects (feeds client profiles)
+    "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS linkedin VARCHAR(255)",
+    "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS experience_years INTEGER",
+    "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS work_auth VARCHAR(50)",
+    "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS availability VARCHAR(50)",
+    "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS availability_date DATE",
+    "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS desired_rate NUMERIC(10,2)",
+    "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS desired_salary NUMERIC(12,2)",
+    "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS resume_text TEXT",
+    "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS notes TEXT",
+    // Client-facing candidate profiles generated per submission
+    `CREATE TABLE IF NOT EXISTS candidate_profiles (
+      id SERIAL PRIMARY KEY,
+      submission_id INTEGER REFERENCES submissions(id) ON DELETE CASCADE,
+      candidate_id INTEGER REFERENCES candidates(id) ON DELETE CASCADE,
+      job_order_id INTEGER REFERENCES job_orders(id) ON DELETE SET NULL,
+      redacted BOOLEAN NOT NULL DEFAULT TRUE,
+      label VARCHAR(100),
+      content TEXT,
+      markdown TEXT,
+      model VARCHAR(100),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
   ];
   for (const sql of statements) {
     try {
@@ -119,7 +143,8 @@ function sendDbError(res, err) {
   res.status(err.status || 500).json({ error: err.message });
 }
 
-const CANDIDATE_COLS  = ['name', 'email', 'phone', 'title', 'company', 'location', 'skills', 'source', 'status'];
+const CANDIDATE_COLS  = ['name', 'email', 'phone', 'title', 'company', 'location', 'skills', 'source', 'status',
+                         'linkedin', 'experience_years', 'work_auth', 'availability', 'availability_date', 'desired_rate', 'desired_salary', 'resume_text', 'notes'];
 const JOB_ORDER_COLS  = ['title', 'company', 'location', 'description', 'salary_min', 'salary_max', 'salary_range', 'status',
                          'source', 'url', 'apollo_job_id', 'apollo_org_id', 'posted_at', 'last_seen_at', 'last_synced_at'];
 const SUBMISSION_COLS = ['candidate_id', 'job_order_id', 'status', 'notes'];
@@ -210,6 +235,15 @@ app.get('/api/setup/init-db', async (req, res) => {
         skills TEXT,
         source VARCHAR(100),
         status VARCHAR(50) DEFAULT 'active',
+        linkedin VARCHAR(255),
+        experience_years INTEGER,
+        work_auth VARCHAR(50),
+        availability VARCHAR(50),
+        availability_date DATE,
+        desired_rate NUMERIC(10,2),
+        desired_salary NUMERIC(12,2),
+        resume_text TEXT,
+        notes TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
@@ -748,6 +782,77 @@ app.post('/api/submissions/:id/remind', authenticateToken, async (req, res) => {
       text,
     });
     res.json({ ok: true, ...result, to: recipient });
+  } catch (err) {
+    sendMailError(res, err);
+  }
+});
+
+// ====== CLIENT-FACING CANDIDATE PROFILES (per submission) ======
+// Redacted by default: identifying details never reach the model and are
+// scrubbed from the output. Pass { redacted: false } for a named version.
+
+async function loadSubmissionContext(id) {
+  const s = await pool.query('SELECT * FROM submissions WHERE id=$1', [id]);
+  if (!s.rows.length) return null;
+  const sub = s.rows[0];
+  const c = sub.candidate_id ? await pool.query('SELECT * FROM candidates WHERE id=$1', [sub.candidate_id]) : { rows: [] };
+  const j = sub.job_order_id ? await pool.query('SELECT * FROM job_orders WHERE id=$1', [sub.job_order_id]) : { rows: [] };
+  return { submission_id: sub.id, submission_status: sub.status, candidate: c.rows[0] || null, job_order: j.rows[0] || null };
+}
+
+app.get('/api/submissions/:id/profile', authenticateToken, async (req, res) => {
+  try {
+    const redacted = String(req.query.redacted ?? 'true') !== 'false';
+    const q = await pool.query(
+      'SELECT * FROM candidate_profiles WHERE submission_id=$1 AND redacted=$2 ORDER BY created_at DESC, id DESC LIMIT 1',
+      [req.params.id, redacted]);
+    if (!q.rows.length) return res.status(404).json({ error: 'No profile generated yet', redacted });
+    const row = q.rows[0];
+    res.json({ ...row, content: row.content ? JSON.parse(row.content) : null });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/submissions/:id/profile', authenticateToken, async (req, res) => {
+  try {
+    if (!isProfileAIConfigured()) return res.status(503).json({ error: 'AI not configured (ANTHROPIC_API_KEY missing)', code: 'AI_NOT_CONFIGURED' });
+    const redacted = (req.body && req.body.redacted === false) ? false : true;
+    const ctx = await loadSubmissionContext(req.params.id);
+    if (!ctx) return res.status(404).json({ error: 'Submission not found' });
+    if (!ctx.candidate) return res.status(400).json({ error: 'Submission has no candidate' });
+
+    const result = await buildCandidateProfile({ candidate: ctx.candidate, jobOrder: ctx.job_order, redacted });
+    const ins = await pool.query(
+      `INSERT INTO candidate_profiles (submission_id, candidate_id, job_order_id, redacted, label, content, markdown, model)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [ctx.submission_id, ctx.candidate.id, ctx.job_order ? ctx.job_order.id : null, redacted, result.label, JSON.stringify(result.profile), result.markdown, result.model]);
+    const row = ins.rows[0];
+    res.status(201).json({ ...row, content: result.profile });
+  } catch (err) {
+    res.status(err.status || 502).json({ error: err.message, code: err.code });
+  }
+});
+
+// Email the latest profile (redacted unless told otherwise) to a client contact.
+app.post('/api/submissions/:id/profile/email', authenticateToken, async (req, res) => {
+  try {
+    const { to, subject, message, redacted: redactedFlag } = req.body || {};
+    const redacted = redactedFlag === false ? false : true;
+    if (!to) return res.status(400).json({ error: 'Recipient email ("to") is required' });
+    const q = await pool.query(
+      'SELECT * FROM candidate_profiles WHERE submission_id=$1 AND redacted=$2 ORDER BY created_at DESC, id DESC LIMIT 1',
+      [req.params.id, redacted]);
+    if (!q.rows.length) return res.status(404).json({ error: 'No profile generated yet; generate it first' });
+    const p = q.rows[0];
+    const intro = message ? `<p>${textToHtml(message)}</p><hr/>` : '';
+    const result = await sendEmail({
+      to,
+      subject: subject || `Candidate Profile: ${p.label}`,
+      html: `${intro}${markdownToHtml(p.markdown)}`,
+      text: `${message ? message + '\n\n---\n\n' : ''}${p.markdown}`,
+    });
+    res.json({ ok: true, ...result, profile_id: p.id, redacted });
   } catch (err) {
     sendMailError(res, err);
   }
