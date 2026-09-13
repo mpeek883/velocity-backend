@@ -12,6 +12,7 @@ const { getApolloClient, isApolloConfigured, ApolloError } = require('./apollo-c
 const { sendEmail, isEmailConfigured, emailTransportName, textToHtml, FROM_EMAIL } = require('./email');
 const { runAssistantChat, isAIConfigured: isAssistantConfigured } = require('./assistant');
 const { buildCandidateProfile, markdownToHtml, isProfileAIConfigured } = require('./candidate-profile');
+const leadScanner = require('./lead-scanner');
 
 // Resume uploads are held in memory (never written to disk) and capped at 5 MB.
 const resumeUpload = multer({
@@ -57,6 +58,45 @@ async function ensureSchema() {
     "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS desired_salary NUMERIC(12,2)",
     "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS resume_text TEXT",
     "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS notes TEXT",
+    // Leads (the app's Leads screen) + recruiter email scanning
+    `CREATE TABLE IF NOT EXISTS leads (
+      id SERIAL PRIMARY KEY,
+      name VARCHAR(255),
+      title VARCHAR(255),
+      company VARCHAR(255),
+      company_address TEXT,
+      company_website VARCHAR(255),
+      email VARCHAR(255),
+      phone VARCHAR(50),
+      linkedin VARCHAR(255),
+      source VARCHAR(100),
+      status VARCHAR(50) DEFAULT 'new',
+      territory VARCHAR(100),
+      score INTEGER,
+      job_title VARCHAR(255),
+      job_location VARCHAR(255),
+      job_description TEXT,
+      rate_or_salary VARCHAR(100),
+      notes TEXT,
+      mailbox VARCHAR(255),
+      message_id VARCHAR(512),
+      email_subject VARCHAR(500),
+      email_received_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS email_scan_log (
+      id SERIAL PRIMARY KEY,
+      mailbox VARCHAR(255),
+      message_id VARCHAR(512) UNIQUE,
+      subject VARCHAR(500),
+      from_email VARCHAR(255),
+      received_at TIMESTAMP,
+      classification VARCHAR(50),
+      reason TEXT,
+      lead_id INTEGER,
+      scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
     // Client-facing candidate profiles generated per submission
     `CREATE TABLE IF NOT EXISTS candidate_profiles (
       id SERIAL PRIMARY KEY,
@@ -148,6 +188,8 @@ const CANDIDATE_COLS  = ['name', 'email', 'phone', 'title', 'company', 'location
 const JOB_ORDER_COLS  = ['title', 'company', 'location', 'description', 'salary_min', 'salary_max', 'salary_range', 'status',
                          'source', 'url', 'apollo_job_id', 'apollo_org_id', 'posted_at', 'last_seen_at', 'last_synced_at'];
 const SUBMISSION_COLS = ['candidate_id', 'job_order_id', 'status', 'notes'];
+const LEAD_COLS       = ['name', 'title', 'company', 'company_address', 'company_website', 'email', 'phone', 'linkedin', 'source', 'status', 'territory', 'score',
+                         'job_title', 'job_location', 'job_description', 'rate_or_salary', 'notes'];
 const PLACEMENT_COLS  = ['submission_id', 'candidate_id', 'job_order_id', 'start_date', 'end_date', 'fee_amount', 'placement_status'];
 
 // ====== MIDDLEWARE ======
@@ -708,6 +750,90 @@ function startApolloSyncScheduler() {
   console.log(`🔄 Apollo job sync scheduled every ${APOLLO_SYNC_INTERVAL_MIN} min`);
 }
 
+// ====== LEADS + RECRUITER EMAIL SCANNING ======
+app.get('/api/leads', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM leads ORDER BY created_at DESC');
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+app.post('/api/leads', authenticateToken, async (req, res) => {
+  try { res.status(201).json(await insertRow('leads', LEAD_COLS, req.body)); } catch (err) { sendDbError(res, err); }
+});
+app.put('/api/leads/:id', authenticateToken, async (req, res) => {
+  try {
+    const row = await updateRow('leads', LEAD_COLS, req.params.id, req.body);
+    if (!row) return res.status(404).json({ error: 'Lead not found' });
+    res.json(row);
+  } catch (err) { sendDbError(res, err); }
+});
+app.delete('/api/leads/:id', authenticateToken, async (req, res) => {
+  try {
+    const deleted = await deleteRow('leads', req.params.id);
+    if (!deleted) return res.status(404).json({ error: 'Lead not found' });
+    res.json({ message: 'Deleted' });
+  } catch (err) { sendDbError(res, err); }
+});
+
+const leadScanState = { running: false, last_run_at: null, last_result: null };
+const LEAD_SCAN_INTERVAL_MIN = parseInt(process.env.LEAD_SCAN_INTERVAL_MIN || '60', 10);
+
+app.get('/api/leads/scan/status', authenticateToken, async (req, res) => {
+  try {
+    const counts = await pool.query("SELECT COUNT(*) AS scanned, SUM(CASE WHEN classification='recruiter_lead' THEN 1 ELSE 0 END) AS leads FROM email_scan_log");
+    res.json({
+      mailboxes: leadScanner.publicMailboxes(),
+      ai_configured: leadScanner.isLeadAIConfigured(),
+      scan_interval_minutes: LEAD_SCAN_INTERVAL_MIN,
+      running: leadScanState.running,
+      last_run_at: leadScanState.last_run_at,
+      last_result: leadScanState.last_result,
+      messages_scanned_total: parseInt(counts.rows[0].scanned, 10) || 0,
+      recruiter_leads_total: parseInt(counts.rows[0].leads, 10) || 0,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+async function runLeadScan(opts = {}) {
+  if (leadScanState.running) return { skipped: true, reason: 'scan already running' };
+  leadScanState.running = true;
+  try {
+    const result = await leadScanner.scanMailboxes({ pool, ...opts });
+    leadScanState.last_run_at = result.finished_at;
+    leadScanState.last_result = result;
+    return result;
+  } finally {
+    leadScanState.running = false;
+  }
+}
+
+app.post('/api/leads/scan', authenticateToken, async (req, res) => {
+  try {
+    if (!leadScanner.isLeadAIConfigured()) return res.status(503).json({ error: 'AI not configured (ANTHROPIC_API_KEY missing)', code: 'AI_NOT_CONFIGURED' });
+    const boxes = leadScanner.listMailboxes();
+    if (!boxes.length) return res.status(503).json({ error: 'No mailboxes configured. Set GRAPH_SCAN_MAILBOXES and/or GMAIL_USER+GMAIL_APP_PASSWORD, VERIZON_USER+VERIZON_APP_PASSWORD, or IMAP_MAILBOXES.', code: 'NO_MAILBOXES' });
+    const { days, max, mailbox } = req.body || {};
+    const selected = mailbox ? boxes.filter((b) => b.address.toLowerCase() === String(mailbox).toLowerCase()) : boxes;
+    if (!selected.length) return res.status(404).json({ error: `Mailbox ${mailbox} is not configured` });
+    res.json(await runLeadScan({ mailboxes: selected, days, max }));
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+function startLeadScanScheduler() {
+  if (!(LEAD_SCAN_INTERVAL_MIN > 0) || process.env.NODE_ENV === 'test' || !leadScanner.isLeadAIConfigured() || !leadScanner.listMailboxes().length) return;
+  const timer = setInterval(() => {
+    runLeadScan().then((s) => console.log('📬 Lead scan:', JSON.stringify({ created: s.leads_created, updated: s.leads_updated, scanned: s.messages_scanned, errors: (s.mailboxes || []).flatMap((m) => m.errors).length }))).catch((e) => console.error('⚠️ Lead scan failed:', e.message));
+  }, LEAD_SCAN_INTERVAL_MIN * 60 * 1000);
+  if (timer.unref) timer.unref();
+  console.log(`📬 Recruiter lead scan scheduled every ${LEAD_SCAN_INTERVAL_MIN} min for ${leadScanner.listMailboxes().map((b) => b.address).join(', ')}`);
+}
+
 // ====== EMAIL AUTOMATION (Phase 5, Task 4) ======
 // Backs the app's Email Templates (candidate outreach), Smart Paste / Email
 // Scanner extraction (via the AI chat route), NDA send, and interview reminders.
@@ -1070,6 +1196,7 @@ app.listen(PORT, () => {
   console.log('   - Jobvertise, Craigslist, Wellfound, PostJobFree');
   console.log('🛠️ Database Setup: GET /api/setup/init-db\n');
   startApolloSyncScheduler();
+  startLeadScanScheduler();
 });
 
 module.exports = { app, syncApolloJobOrders };

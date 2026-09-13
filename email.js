@@ -132,4 +132,9 @@ async function sendEmail(mail, options = {}) {
   throw Object.assign(new Error('Email is not configured (set MS_TENANT_ID/MS_CLIENT_ID/MS_CLIENT_SECRET or SMTP_HOST/SMTP_USER/SMTP_PASS)'), { status: 503, code: 'EMAIL_NOT_CONFIGURED' });
 }
 
-module.exports = { sendEmail, isEmailConfigured, emailTransportName, textToHtml, FROM_EMAIL, FROM_NAME, _resetGraphToken: () => { graphToken = { value: null, expires: 0 }; } };
+module.exports = {
+  sendEmail, isEmailConfigured, emailTransportName, textToHtml, FROM_EMAIL, FROM_NAME,
+  graphConfigured,
+  getGraphAccessToken: (fetchImpl = global.fetch) => getGraphToken(fetchImpl),
+  _resetGraphToken: () => { graphToken = { value: null, expires: 0 }; },
+};
