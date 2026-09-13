@@ -24,13 +24,90 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
 
+// Additive schema updates so existing databases pick up columns the frontend
+// panels use. Each statement is idempotent (ADD COLUMN IF NOT EXISTS).
+async function ensureSchema() {
+  const statements = [
+    "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'active'",
+    "ALTER TABLE job_orders ADD COLUMN IF NOT EXISTS salary_range VARCHAR(100)",
+    "ALTER TABLE submissions ADD COLUMN IF NOT EXISTS notes TEXT",
+    "ALTER TABLE placements ADD COLUMN IF NOT EXISTS candidate_id INTEGER REFERENCES candidates(id)",
+    "ALTER TABLE placements ADD COLUMN IF NOT EXISTS job_order_id INTEGER REFERENCES job_orders(id)",
+    "ALTER TABLE placements ADD COLUMN IF NOT EXISTS placement_status VARCHAR(50) DEFAULT 'active'",
+  ];
+  for (const sql of statements) {
+    try {
+      await pool.query(sql);
+    } catch (err) {
+      console.error('⚠️ Schema update failed:', sql, '-', err.message);
+    }
+  }
+  console.log('✅ Schema check complete');
+}
+
 pool.query('SELECT NOW()', (err, result) => {
   if (err) {
     console.error('❌ Database connection error:', err.message);
   } else {
     console.log('✅ Database connected successfully at:', result.rows[0].now);
+    ensureSchema();
   }
 });
+
+// ====== GENERIC ROW HELPERS ======
+// Build INSERT/UPDATE statements from an allowlist of real columns, so extra
+// fields sent by different frontends are ignored instead of causing errors.
+// Empty strings become NULL so numeric and date columns accept blank inputs.
+function pickColumns(body, allowed) {
+  const cols = [];
+  const vals = [];
+  for (const col of allowed) {
+    if (body && Object.prototype.hasOwnProperty.call(body, col)) {
+      cols.push(col);
+      vals.push(body[col] === '' ? null : body[col]);
+    }
+  }
+  return { cols, vals };
+}
+
+async function insertRow(table, allowed, body) {
+  const { cols, vals } = pickColumns(body, allowed);
+  if (!cols.length) throw Object.assign(new Error('No valid fields provided'), { status: 400 });
+  const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
+  const result = await pool.query(
+    `INSERT INTO ${table} (${cols.join(', ')}) VALUES (${placeholders}) RETURNING *`,
+    vals
+  );
+  return result.rows[0];
+}
+
+async function updateRow(table, allowed, id, body) {
+  const { cols, vals } = pickColumns(body, allowed);
+  if (!cols.length) throw Object.assign(new Error('No valid fields provided'), { status: 400 });
+  const sets = cols.map((c, i) => `${c}=$${i + 1}`).join(', ');
+  const result = await pool.query(
+    `UPDATE ${table} SET ${sets}, updated_at=CURRENT_TIMESTAMP WHERE id=$${cols.length + 1} RETURNING *`,
+    [...vals, id]
+  );
+  return result.rows[0] || null;
+}
+
+async function deleteRow(table, id) {
+  const result = await pool.query(`DELETE FROM ${table} WHERE id=$1`, [id]);
+  return result.rowCount > 0;
+}
+
+function sendDbError(res, err) {
+  if (err.code === '23503' || /violates foreign key constraint/i.test(err.message || '')) {
+    return res.status(409).json({ error: 'This record is linked to other records (for example submissions or placements) and cannot be deleted.' });
+  }
+  res.status(err.status || 500).json({ error: err.message });
+}
+
+const CANDIDATE_COLS  = ['name', 'email', 'phone', 'title', 'company', 'location', 'skills', 'source', 'status'];
+const JOB_ORDER_COLS  = ['title', 'company', 'location', 'description', 'salary_min', 'salary_max', 'salary_range', 'status'];
+const SUBMISSION_COLS = ['candidate_id', 'job_order_id', 'status', 'notes'];
+const PLACEMENT_COLS  = ['submission_id', 'candidate_id', 'job_order_id', 'start_date', 'end_date', 'fee_amount', 'placement_status'];
 
 // ====== MIDDLEWARE ======
 app.use(helmet());
@@ -116,6 +193,7 @@ app.get('/api/setup/init-db', async (req, res) => {
         location VARCHAR(255),
         skills TEXT,
         source VARCHAR(100),
+        status VARCHAR(50) DEFAULT 'active',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
@@ -128,6 +206,7 @@ app.get('/api/setup/init-db', async (req, res) => {
         description TEXT,
         salary_min DECIMAL(10,2),
         salary_max DECIMAL(10,2),
+        salary_range VARCHAR(100),
         status VARCHAR(50),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -138,6 +217,7 @@ app.get('/api/setup/init-db', async (req, res) => {
         candidate_id INTEGER REFERENCES candidates(id),
         job_order_id INTEGER REFERENCES job_orders(id),
         status VARCHAR(50),
+        notes TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
@@ -145,9 +225,12 @@ app.get('/api/setup/init-db', async (req, res) => {
       CREATE TABLE placements (
         id SERIAL PRIMARY KEY,
         submission_id INTEGER REFERENCES submissions(id),
+        candidate_id INTEGER REFERENCES candidates(id),
+        job_order_id INTEGER REFERENCES job_orders(id),
         start_date DATE,
         end_date DATE,
         fee_amount DECIMAL(10,2),
+        placement_status VARCHAR(50) DEFAULT 'active',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
@@ -312,14 +395,29 @@ app.get('/api/candidates', authenticateToken, async (req, res) => {
 
 app.post('/api/candidates', authenticateToken, async (req, res) => {
   try {
-    const { name, email, phone, title, company, location, skills, source } = req.body;
-    const result = await pool.query(
-      'INSERT INTO candidates (name, email, phone, title, company, location, skills, source) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
-      [name, email, phone, title, company, location, skills, source]
-    );
-    res.status(201).json(result.rows[0]);
+    res.status(201).json(await insertRow('candidates', CANDIDATE_COLS, req.body));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendDbError(res, err);
+  }
+});
+
+app.put('/api/candidates/:id', authenticateToken, async (req, res) => {
+  try {
+    const row = await updateRow('candidates', CANDIDATE_COLS, req.params.id, req.body);
+    if (!row) return res.status(404).json({ error: 'Candidate not found' });
+    res.json(row);
+  } catch (err) {
+    sendDbError(res, err);
+  }
+});
+
+app.delete('/api/candidates/:id', authenticateToken, async (req, res) => {
+  try {
+    const deleted = await deleteRow('candidates', req.params.id);
+    if (!deleted) return res.status(404).json({ error: 'Candidate not found' });
+    res.json({ message: 'Deleted' });
+  } catch (err) {
+    sendDbError(res, err);
   }
 });
 
@@ -361,14 +459,29 @@ app.get('/api/job-orders', authenticateToken, async (req, res) => {
 
 app.post('/api/job-orders', authenticateToken, async (req, res) => {
   try {
-    const { title, company, location, description, salary_min, salary_max, status } = req.body;
-    const result = await pool.query(
-      'INSERT INTO job_orders (title, company, location, description, salary_min, salary_max, status) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
-      [title, company, location, description, salary_min, salary_max, status]
-    );
-    res.status(201).json(result.rows[0]);
+    res.status(201).json(await insertRow('job_orders', JOB_ORDER_COLS, req.body));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendDbError(res, err);
+  }
+});
+
+app.put('/api/job-orders/:id', authenticateToken, async (req, res) => {
+  try {
+    const row = await updateRow('job_orders', JOB_ORDER_COLS, req.params.id, req.body);
+    if (!row) return res.status(404).json({ error: 'Job order not found' });
+    res.json(row);
+  } catch (err) {
+    sendDbError(res, err);
+  }
+});
+
+app.delete('/api/job-orders/:id', authenticateToken, async (req, res) => {
+  try {
+    const deleted = await deleteRow('job_orders', req.params.id);
+    if (!deleted) return res.status(404).json({ error: 'Job order not found' });
+    res.json({ message: 'Deleted' });
+  } catch (err) {
+    sendDbError(res, err);
   }
 });
 
@@ -384,14 +497,29 @@ app.get('/api/submissions', authenticateToken, async (req, res) => {
 
 app.post('/api/submissions', authenticateToken, async (req, res) => {
   try {
-    const { candidate_id, job_order_id, status } = req.body;
-    const result = await pool.query(
-      'INSERT INTO submissions (candidate_id, job_order_id, status) VALUES ($1, $2, $3) RETURNING *',
-      [candidate_id, job_order_id, status]
-    );
-    res.status(201).json(result.rows[0]);
+    res.status(201).json(await insertRow('submissions', SUBMISSION_COLS, req.body));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendDbError(res, err);
+  }
+});
+
+app.put('/api/submissions/:id', authenticateToken, async (req, res) => {
+  try {
+    const row = await updateRow('submissions', SUBMISSION_COLS, req.params.id, req.body);
+    if (!row) return res.status(404).json({ error: 'Submission not found' });
+    res.json(row);
+  } catch (err) {
+    sendDbError(res, err);
+  }
+});
+
+app.delete('/api/submissions/:id', authenticateToken, async (req, res) => {
+  try {
+    const deleted = await deleteRow('submissions', req.params.id);
+    if (!deleted) return res.status(404).json({ error: 'Submission not found' });
+    res.json({ message: 'Deleted' });
+  } catch (err) {
+    sendDbError(res, err);
   }
 });
 
@@ -407,14 +535,29 @@ app.get('/api/placements', authenticateToken, async (req, res) => {
 
 app.post('/api/placements', authenticateToken, async (req, res) => {
   try {
-    const { submission_id, start_date, end_date, fee_amount } = req.body;
-    const result = await pool.query(
-      'INSERT INTO placements (submission_id, start_date, end_date, fee_amount) VALUES ($1, $2, $3, $4) RETURNING *',
-      [submission_id, start_date, end_date, fee_amount]
-    );
-    res.status(201).json(result.rows[0]);
+    res.status(201).json(await insertRow('placements', PLACEMENT_COLS, req.body));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendDbError(res, err);
+  }
+});
+
+app.put('/api/placements/:id', authenticateToken, async (req, res) => {
+  try {
+    const row = await updateRow('placements', PLACEMENT_COLS, req.params.id, req.body);
+    if (!row) return res.status(404).json({ error: 'Placement not found' });
+    res.json(row);
+  } catch (err) {
+    sendDbError(res, err);
+  }
+});
+
+app.delete('/api/placements/:id', authenticateToken, async (req, res) => {
+  try {
+    const deleted = await deleteRow('placements', req.params.id);
+    if (!deleted) return res.status(404).json({ error: 'Placement not found' });
+    res.json({ message: 'Deleted' });
+  } catch (err) {
+    sendDbError(res, err);
   }
 });
 
