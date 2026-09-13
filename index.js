@@ -8,6 +8,7 @@ const FreeSourcesScraper = require('./free-sources-scraper');
 const multer = require('multer');
 const { extractText, parseResumeText } = require('./resume-parser');
 const { extractCandidateWithAI, isAIConfigured } = require('./resume-ai');
+const { getApolloClient, isApolloConfigured, ApolloError } = require('./apollo-client');
 
 // Resume uploads are held in memory (never written to disk) and capped at 5 MB.
 const resumeUpload = multer({
@@ -35,6 +36,14 @@ async function ensureSchema() {
     "ALTER TABLE placements ADD COLUMN IF NOT EXISTS candidate_id INTEGER REFERENCES candidates(id)",
     "ALTER TABLE placements ADD COLUMN IF NOT EXISTS job_order_id INTEGER REFERENCES job_orders(id)",
     "ALTER TABLE placements ADD COLUMN IF NOT EXISTS placement_status VARCHAR(50) DEFAULT 'active'",
+    // Apollo job posting integration (Phase 4)
+    "ALTER TABLE job_orders ADD COLUMN IF NOT EXISTS source VARCHAR(50)",
+    "ALTER TABLE job_orders ADD COLUMN IF NOT EXISTS url TEXT",
+    "ALTER TABLE job_orders ADD COLUMN IF NOT EXISTS apollo_job_id VARCHAR(64)",
+    "ALTER TABLE job_orders ADD COLUMN IF NOT EXISTS apollo_org_id VARCHAR(64)",
+    "ALTER TABLE job_orders ADD COLUMN IF NOT EXISTS posted_at TIMESTAMP",
+    "ALTER TABLE job_orders ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP",
+    "ALTER TABLE job_orders ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMP",
   ];
   for (const sql of statements) {
     try {
@@ -109,7 +118,8 @@ function sendDbError(res, err) {
 }
 
 const CANDIDATE_COLS  = ['name', 'email', 'phone', 'title', 'company', 'location', 'skills', 'source', 'status'];
-const JOB_ORDER_COLS  = ['title', 'company', 'location', 'description', 'salary_min', 'salary_max', 'salary_range', 'status'];
+const JOB_ORDER_COLS  = ['title', 'company', 'location', 'description', 'salary_min', 'salary_max', 'salary_range', 'status',
+                         'source', 'url', 'apollo_job_id', 'apollo_org_id', 'posted_at', 'last_seen_at', 'last_synced_at'];
 const SUBMISSION_COLS = ['candidate_id', 'job_order_id', 'status', 'notes'];
 const PLACEMENT_COLS  = ['submission_id', 'candidate_id', 'job_order_id', 'start_date', 'end_date', 'fee_amount', 'placement_status'];
 
@@ -212,6 +222,13 @@ app.get('/api/setup/init-db', async (req, res) => {
         salary_max DECIMAL(10,2),
         salary_range VARCHAR(100),
         status VARCHAR(50),
+        source VARCHAR(50),
+        url TEXT,
+        apollo_job_id VARCHAR(64),
+        apollo_org_id VARCHAR(64),
+        posted_at TIMESTAMP,
+        last_seen_at TIMESTAMP,
+        last_synced_at TIMESTAMP,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
@@ -501,6 +518,160 @@ app.delete('/api/job-orders/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// ====== APOLLO.IO JOB DATA (Phase 4) ======
+// Task 1: client (apollo-client.js). Task 2: company search, postings, import.
+// Task 3: sync that refreshes imported postings and closes vanished ones.
+const apolloSyncState = { last_run_at: null, last_result: null, running: false };
+const APOLLO_SYNC_INTERVAL_MIN = parseInt(process.env.APOLLO_SYNC_INTERVAL_MIN || '240', 10);
+
+function sendApolloError(res, err) {
+  if (err instanceof ApolloError) return res.status(err.status).json({ error: err.message, code: err.code, retry_after: err.retryAfter });
+  return res.status(500).json({ error: err.message });
+}
+
+app.get('/api/apollo/status', authenticateToken, async (req, res) => {
+  try {
+    const counts = await pool.query(
+      "SELECT COALESCE(SUM(CASE WHEN source='apollo' THEN 1 ELSE 0 END),0) AS imported, COALESCE(SUM(CASE WHEN source='apollo' AND status<>'closed' THEN 1 ELSE 0 END),0) AS open FROM job_orders"
+    );
+    res.json({
+      configured: isApolloConfigured(),
+      sync_interval_minutes: APOLLO_SYNC_INTERVAL_MIN,
+      last_sync: apolloSyncState.last_run_at,
+      last_result: apolloSyncState.last_result,
+      running: apolloSyncState.running,
+      imported_job_orders: parseInt(counts.rows[0].imported, 10),
+      open_apollo_job_orders: parseInt(counts.rows[0].open, 10),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/apollo/companies', authenticateToken, async (req, res) => {
+  try {
+    const result = await getApolloClient().searchOrganizations(req.query.q, { page: parseInt(req.query.page || '1', 10), perPage: 10 });
+    res.json(result);
+  } catch (err) {
+    sendApolloError(res, err);
+  }
+});
+
+app.get('/api/apollo/companies/:id/jobs', authenticateToken, async (req, res) => {
+  try {
+    const { postings } = await getApolloClient().getJobPostings(req.params.id, { page: parseInt(req.query.page || '1', 10), perPage: 100 });
+    const ids = postings.map((p) => p.id).filter(Boolean);
+    let imported = new Set();
+    if (ids.length) {
+      const existing = await pool.query('SELECT apollo_job_id, id, status FROM job_orders WHERE apollo_job_id = ANY($1)', [ids]);
+      imported = new Map(existing.rows.map((r) => [r.apollo_job_id, { id: r.id, status: r.status }]));
+    }
+    res.json({ postings: postings.map((p) => ({ ...p, imported: imported.get ? imported.get(p.id) || null : null })) });
+  } catch (err) {
+    sendApolloError(res, err);
+  }
+});
+
+app.post('/api/apollo/import-jobs', authenticateToken, async (req, res) => {
+  try {
+    const { organization_id, organization_name, postings } = req.body || {};
+    if (!organization_id || !Array.isArray(postings) || !postings.length) {
+      return res.status(400).json({ error: 'organization_id and a non-empty postings array are required' });
+    }
+    const created = [];
+    const skipped = [];
+    for (const p of postings) {
+      if (!p || !p.id || !p.title) { skipped.push({ id: p && p.id, reason: 'missing id or title' }); continue; }
+      const dup = await pool.query('SELECT id FROM job_orders WHERE apollo_job_id=$1', [String(p.id)]);
+      if (dup.rows.length) { skipped.push({ id: p.id, reason: 'already imported', job_order_id: dup.rows[0].id }); continue; }
+      const row = await insertRow('job_orders', JOB_ORDER_COLS, {
+        title: p.title,
+        company: organization_name || p.company || '',
+        location: p.location || [p.city, p.state, p.country].filter(Boolean).join(', '),
+        description: p.url ? `Imported from Apollo. Original posting: ${p.url}` : 'Imported from Apollo.',
+        status: 'open',
+        source: 'apollo',
+        url: p.url || null,
+        apollo_job_id: String(p.id),
+        apollo_org_id: String(organization_id),
+        posted_at: p.posted_at || null,
+        last_seen_at: p.last_seen_at || null,
+        last_synced_at: new Date().toISOString(),
+      });
+      created.push(row);
+    }
+    res.status(201).json({ created, skipped });
+  } catch (err) {
+    sendDbError(res, err);
+  }
+});
+
+// Task 3: refresh every imported, still-open job order against Apollo.
+// Costs one Apollo credit per company checked. Postings that Apollo no longer
+// lists are marked closed. Safe to run repeatedly; no-op when nothing to check.
+async function syncApolloJobOrders(client = getApolloClient()) {
+  if (apolloSyncState.running) return { skipped: true, reason: 'sync already running' };
+  apolloSyncState.running = true;
+  const summary = { orgs_checked: 0, refreshed: 0, closed: 0, errors: [], started_at: new Date().toISOString() };
+  try {
+    const open = await pool.query("SELECT id, apollo_job_id, apollo_org_id FROM job_orders WHERE source='apollo' AND apollo_org_id IS NOT NULL AND status<>'closed'");
+    const byOrg = new Map();
+    for (const r of open.rows) {
+      if (!byOrg.has(r.apollo_org_id)) byOrg.set(r.apollo_org_id, []);
+      byOrg.get(r.apollo_org_id).push(r);
+    }
+    for (const [orgId, rows] of byOrg) {
+      try {
+        const { postings } = await client.getJobPostings(orgId, { perPage: 500 });
+        summary.orgs_checked += 1;
+        const live = new Map(postings.map((p) => [String(p.id), p]));
+        const now = new Date().toISOString();
+        for (const r of rows) {
+          const p = live.get(String(r.apollo_job_id));
+          if (p) {
+            await pool.query('UPDATE job_orders SET last_seen_at=$1, url=COALESCE($2,url), last_synced_at=$3, updated_at=CURRENT_TIMESTAMP WHERE id=$4',
+              [p.last_seen_at || now, p.url || null, now, r.id]);
+            summary.refreshed += 1;
+          } else {
+            await pool.query("UPDATE job_orders SET status='closed', last_synced_at=$1, updated_at=CURRENT_TIMESTAMP WHERE id=$2", [now, r.id]);
+            summary.closed += 1;
+          }
+        }
+      } catch (err) {
+        summary.errors.push({ organization_id: orgId, error: err.message });
+        if (err instanceof ApolloError && (err.code === 'APOLLO_RATE_LIMIT' || err.code === 'APOLLO_NO_CREDITS' || err.code === 'APOLLO_AUTH')) break;
+      }
+    }
+  } catch (err) {
+    summary.errors.push({ error: err.message });
+  } finally {
+    summary.finished_at = new Date().toISOString();
+    apolloSyncState.running = false;
+    apolloSyncState.last_run_at = summary.finished_at;
+    apolloSyncState.last_result = summary;
+  }
+  return summary;
+}
+
+app.post('/api/apollo/sync', authenticateToken, async (req, res) => {
+  try {
+    if (!isApolloConfigured()) return res.status(503).json({ error: 'Apollo is not configured (APOLLO_API_KEY missing)', code: 'APOLLO_NOT_CONFIGURED' });
+    res.json(await syncApolloJobOrders());
+  } catch (err) {
+    sendApolloError(res, err);
+  }
+});
+
+function startApolloSyncScheduler() {
+  if (!isApolloConfigured() || !(APOLLO_SYNC_INTERVAL_MIN > 0) || process.env.NODE_ENV === 'test') return;
+  const ms = APOLLO_SYNC_INTERVAL_MIN * 60 * 1000;
+  const timer = setInterval(() => {
+    syncApolloJobOrders().then((s) => console.log('🔄 Apollo sync:', JSON.stringify(s))).catch((e) => console.error('⚠️ Apollo sync failed:', e.message));
+  }, ms);
+  if (timer.unref) timer.unref();
+  console.log(`🔄 Apollo job sync scheduled every ${APOLLO_SYNC_INTERVAL_MIN} min`);
+}
+
 // SUBMISSIONS
 app.get('/api/submissions', authenticateToken, async (req, res) => {
   try {
@@ -695,4 +866,7 @@ app.listen(PORT, () => {
   console.log('🔍 Free Sources Scraping: ENABLED ✨');
   console.log('   - Jobvertise, Craigslist, Wellfound, PostJobFree');
   console.log('🛠️ Database Setup: GET /api/setup/init-db\n');
+  startApolloSyncScheduler();
 });
+
+module.exports = { app, syncApolloJobOrders };
