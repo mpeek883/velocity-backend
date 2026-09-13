@@ -5,6 +5,14 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 const { Pool } = require('pg');
 const FreeSourcesScraper = require('./free-sources-scraper');
+const multer = require('multer');
+const { extractText, parseResumeText } = require('./resume-parser');
+
+// Resume uploads are held in memory (never written to disk) and capped at 5 MB.
+const resumeUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024, files: 1 },
+});
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -313,6 +321,32 @@ app.post('/api/candidates', authenticateToken, async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// Parse an uploaded resume (PDF, DOCX, or TXT) and return candidate fields
+// for pre-filling the Add Candidate form. Multipart field name: "resume".
+app.post('/api/candidates/parse-resume', authenticateToken, (req, res) => {
+  resumeUpload.single('resume')(req, res, async (uploadErr) => {
+    if (uploadErr) {
+      const msg = uploadErr.code === 'LIMIT_FILE_SIZE'
+        ? 'Resume file is too large (max 5 MB).'
+        : uploadErr.message;
+      return res.status(400).json({ error: msg });
+    }
+    if (!req.file) {
+      return res.status(400).json({ error: 'No resume file uploaded. Send it as multipart field "resume".' });
+    }
+    try {
+      const text = await extractText(req.file.buffer, req.file.originalname);
+      if (!text.trim()) {
+        return res.status(422).json({ error: 'Could not read any text from that file. If it is a scanned PDF, please use a text-based PDF or DOCX.' });
+      }
+      const fields = parseResumeText(text);
+      res.json({ ...fields, filename: req.file.originalname, text_length: text.length });
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message || 'Failed to parse resume' });
+    }
+  });
 });
 
 // JOB ORDERS
