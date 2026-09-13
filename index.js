@@ -7,6 +7,7 @@ const { Pool } = require('pg');
 const FreeSourcesScraper = require('./free-sources-scraper');
 const multer = require('multer');
 const { extractText, parseResumeText } = require('./resume-parser');
+const { extractCandidateWithAI, isAIConfigured } = require('./resume-ai');
 
 // Resume uploads are held in memory (never written to disk) and capped at 5 MB.
 const resumeUpload = multer({
@@ -439,7 +440,19 @@ app.post('/api/candidates/parse-resume', authenticateToken, (req, res) => {
       if (!text.trim()) {
         return res.status(422).json({ error: 'Could not read any text from that file. If it is a scanned PDF, please use a text-based PDF or DOCX.' });
       }
-      const fields = parseResumeText(text);
+      // Prefer AI extraction (handles any resume layout); fall back to the
+      // rule-based parser when no API key is configured or the call fails.
+      let fields;
+      if (isAIConfigured()) {
+        try {
+          fields = await extractCandidateWithAI(text);
+        } catch (aiErr) {
+          console.error('⚠️ AI resume extraction failed, using rule-based parser:', aiErr.message);
+          fields = { ...parseResumeText(text), parser: 'rules', ai_error: aiErr.message };
+        }
+      } else {
+        fields = { ...parseResumeText(text), parser: 'rules' };
+      }
       res.json({ ...fields, filename: req.file.originalname, text_length: text.length });
     } catch (err) {
       res.status(err.status || 500).json({ error: err.message || 'Failed to parse resume' });
