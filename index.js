@@ -13,6 +13,7 @@ const { sendEmail, isEmailConfigured, emailTransportName, textToHtml, FROM_EMAIL
 const { runAssistantChat, isAIConfigured: isAssistantConfigured } = require('./assistant');
 const { buildCandidateProfile, markdownToHtml, isProfileAIConfigured } = require('./candidate-profile');
 const leadScanner = require('./lead-scanner');
+const leadWorkflow = require('./lead-workflow');
 
 // Resume uploads are held in memory (never written to disk) and capped at 5 MB.
 const resumeUpload = multer({
@@ -82,6 +83,59 @@ async function ensureSchema() {
       message_id VARCHAR(512),
       email_subject VARCHAR(500),
       email_received_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
+    // Reply workflow fields on leads
+    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS workflow_status VARCHAR(50) DEFAULT 'new'",
+    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS end_client VARCHAR(255)",
+    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS employment_type VARCHAR(50)",
+    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS work_arrangement VARCHAR(50)",
+    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS missing_info TEXT",
+    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP",
+    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS replied_at TIMESTAMP",
+    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS last_inbound_at TIMESTAMP",
+    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS follow_up_due_at TIMESTAMP",
+    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS opportunity_id INTEGER",
+    // Where the lead came from: 'system' (inbox scan) or 'manual' (entered in the app)
+    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS origin VARCHAR(20) DEFAULT 'manual'",
+    "UPDATE leads SET origin='system' WHERE origin IS NULL AND message_id IS NOT NULL",
+    "UPDATE leads SET origin='manual' WHERE origin IS NULL",
+    `CREATE TABLE IF NOT EXISTS lead_emails (
+      id SERIAL PRIMARY KEY,
+      lead_id INTEGER REFERENCES leads(id) ON DELETE CASCADE,
+      direction VARCHAR(10),
+      kind VARCHAR(30),
+      subject VARCHAR(500),
+      body TEXT,
+      message_id VARCHAR(512),
+      from_email VARCHAR(255),
+      to_email VARCHAR(255),
+      analysis TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS opportunities (
+      id SERIAL PRIMARY KEY,
+      name VARCHAR(255),
+      account VARCHAR(255),
+      contact VARCHAR(255),
+      contact_email VARCHAR(255),
+      value NUMERIC(12,2),
+      stage VARCHAR(50) DEFAULT 'Prospecting',
+      probability INTEGER DEFAULT 20,
+      close_date DATE,
+      type VARCHAR(50) DEFAULT 'New Business',
+      competitor VARCHAR(255),
+      notes TEXT,
+      forecast_category VARCHAR(50),
+      win_loss_reason TEXT,
+      job_title VARCHAR(255),
+      job_description TEXT,
+      client_name VARCHAR(255),
+      rate VARCHAR(100),
+      work_location VARCHAR(255),
+      work_arrangement VARCHAR(50),
+      lead_id INTEGER,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`,
@@ -189,7 +243,10 @@ const JOB_ORDER_COLS  = ['title', 'company', 'location', 'description', 'salary_
                          'source', 'url', 'apollo_job_id', 'apollo_org_id', 'posted_at', 'last_seen_at', 'last_synced_at'];
 const SUBMISSION_COLS = ['candidate_id', 'job_order_id', 'status', 'notes'];
 const LEAD_COLS       = ['name', 'title', 'company', 'company_address', 'company_website', 'email', 'phone', 'linkedin', 'source', 'status', 'territory', 'score',
-                         'job_title', 'job_location', 'job_description', 'rate_or_salary', 'notes'];
+                         'job_title', 'job_location', 'job_description', 'rate_or_salary', 'notes',
+                         'end_client', 'employment_type', 'work_arrangement', 'workflow_status'];
+const OPP_COLS        = ['name', 'account', 'contact', 'contact_email', 'value', 'stage', 'probability', 'close_date', 'type', 'competitor', 'notes', 'forecast_category', 'win_loss_reason',
+                         'job_title', 'job_description', 'client_name', 'rate', 'work_location', 'work_arrangement', 'lead_id'];
 const PLACEMENT_COLS  = ['submission_id', 'candidate_id', 'job_order_id', 'start_date', 'end_date', 'fee_amount', 'placement_status'];
 
 // ====== MIDDLEWARE ======
@@ -825,13 +882,129 @@ app.post('/api/leads/scan', authenticateToken, async (req, res) => {
   }
 });
 
+// ---- Reply workflow: review -> AI draft -> send -> replies / follow-ups ----
+async function loadLead(id) {
+  const q = await pool.query('SELECT * FROM leads WHERE id=$1', [id]);
+  return q.rows[0] || null;
+}
+
+app.post('/api/leads/:id/review', authenticateToken, async (req, res) => {
+  try {
+    const lead = await loadLead(req.params.id);
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+    const draft = await leadWorkflow.draftOfferReply(lead);
+    const updated = await leadWorkflow.setLead(pool, lead.id, {
+      workflow_status: ['new', 'reviewed'].includes(lead.workflow_status || 'new') ? 'reviewed' : lead.workflow_status,
+      reviewed_at: lead.reviewed_at || new Date(),
+      missing_info: JSON.stringify(draft.missing.map((m) => m.key)),
+    });
+    res.json({ lead: updated, draft: { subject: draft.subject, body: draft.body, model: draft.model }, missing: draft.missing });
+  } catch (err) {
+    res.status(err.status || 502).json({ error: err.message, code: err.code });
+  }
+});
+
+app.post('/api/leads/:id/reply', authenticateToken, async (req, res) => {
+  try {
+    const lead = await loadLead(req.params.id);
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+    const { subject, body } = req.body || {};
+    if (!subject || !body) return res.status(400).json({ error: 'subject and body are required' });
+    const missing = leadWorkflow.missingInfo(lead);
+    const result = await leadWorkflow.sendLeadEmail(pool, lead, {
+      kind: 'offer_reply', subject, body,
+      status: missing.length ? 'awaiting_info' : 'replied',
+      extra: { missing_info: JSON.stringify(missing.map((m) => m.key)) },
+    });
+    res.json({ ok: true, transport: result.transport, lead: result.lead, missing });
+  } catch (err) {
+    res.status(err.status || 502).json({ error: err.message, code: err.code });
+  }
+});
+
+app.post('/api/leads/:id/close-out', authenticateToken, async (req, res) => {
+  try {
+    const lead = await loadLead(req.params.id);
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+    const mail = leadWorkflow.closeOutEmail(lead);
+    const result = await leadWorkflow.sendLeadEmail(pool, lead, { kind: 'close_out', ...mail, status: (req.body && req.body.status) || 'declined' });
+    res.json({ ok: true, transport: result.transport, lead: result.lead });
+  } catch (err) {
+    res.status(err.status || 502).json({ error: err.message, code: err.code });
+  }
+});
+
+app.get('/api/leads/:id/emails', authenticateToken, async (req, res) => {
+  try {
+    const q = await pool.query('SELECT * FROM lead_emails WHERE lead_id=$1 ORDER BY created_at, id', [req.params.id]);
+    res.json(q.rows.map((r) => ({ ...r, analysis: r.analysis ? JSON.parse(r.analysis) : null })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Simulate/record an inbound reply without scanning (used for testing and for
+// pasting a reply that arrived elsewhere).
+app.post('/api/leads/:id/inbound', authenticateToken, async (req, res) => {
+  try {
+    const lead = await loadLead(req.params.id);
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+    const { subject, text, message_id } = req.body || {};
+    if (!text) return res.status(400).json({ error: 'text is required' });
+    const outcome = await leadWorkflow.handleInboundReply(pool, lead, { subject: subject || `Re: ${lead.email_subject || ''}`, text, message_id: message_id || null, from_email: lead.email });
+    res.json(outcome);
+  } catch (err) {
+    res.status(err.status || 502).json({ error: err.message, code: err.code });
+  }
+});
+
+app.post('/api/leads/workflow/run', authenticateToken, async (req, res) => {
+  try {
+    res.json(await leadWorkflow.processFollowUps(pool, { now: (req.body && req.body.now) ? new Date(req.body.now) : new Date() }));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// OPPORTUNITIES (the app's Opportunities screen; also created by the workflow)
+app.get('/api/opportunities', authenticateToken, async (req, res) => {
+  try { res.json((await pool.query('SELECT * FROM opportunities ORDER BY created_at DESC')).rows); } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.post('/api/opportunities', authenticateToken, async (req, res) => {
+  try { res.status(201).json(await insertRow('opportunities', OPP_COLS, req.body)); } catch (err) { sendDbError(res, err); }
+});
+app.put('/api/opportunities/:id', authenticateToken, async (req, res) => {
+  try {
+    const row = await updateRow('opportunities', OPP_COLS, req.params.id, req.body);
+    if (!row) return res.status(404).json({ error: 'Opportunity not found' });
+    res.json(row);
+  } catch (err) { sendDbError(res, err); }
+});
+app.delete('/api/opportunities/:id', authenticateToken, async (req, res) => {
+  try {
+    const deleted = await deleteRow('opportunities', req.params.id);
+    if (!deleted) return res.status(404).json({ error: 'Opportunity not found' });
+    res.json({ message: 'Deleted' });
+  } catch (err) { sendDbError(res, err); }
+});
+
 function startLeadScanScheduler() {
-  if (!(LEAD_SCAN_INTERVAL_MIN > 0) || process.env.NODE_ENV === 'test' || !leadScanner.isLeadAIConfigured() || !leadScanner.listMailboxes().length) return;
-  const timer = setInterval(() => {
-    runLeadScan().then((s) => console.log('📬 Lead scan:', JSON.stringify({ created: s.leads_created, updated: s.leads_updated, scanned: s.messages_scanned, errors: (s.mailboxes || []).flatMap((m) => m.errors).length }))).catch((e) => console.error('⚠️ Lead scan failed:', e.message));
+  if (!(LEAD_SCAN_INTERVAL_MIN > 0) || process.env.NODE_ENV === 'test' || !leadScanner.isLeadAIConfigured()) return;
+  const hasMailboxes = leadScanner.listMailboxes().length > 0;
+  const timer = setInterval(async () => {
+    try {
+      if (hasMailboxes) {
+        const s = await runLeadScan();
+        console.log('📬 Lead scan:', JSON.stringify({ created: s.leads_created, updated: s.leads_updated, replies: s.replies_handled || 0, scanned: s.messages_scanned, errors: (s.mailboxes || []).flatMap((m) => m.errors).length }));
+      }
+      const f = await leadWorkflow.processFollowUps(pool);
+      if (f.checked) console.log('📬 Lead follow-ups:', JSON.stringify(f));
+    } catch (e) {
+      console.error('⚠️ Lead scan/follow-up failed:', e.message);
+    }
   }, LEAD_SCAN_INTERVAL_MIN * 60 * 1000);
   if (timer.unref) timer.unref();
-  console.log(`📬 Recruiter lead scan scheduled every ${LEAD_SCAN_INTERVAL_MIN} min for ${leadScanner.listMailboxes().map((b) => b.address).join(', ')}`);
+  console.log(`📬 Lead workflow scheduled every ${LEAD_SCAN_INTERVAL_MIN} min${hasMailboxes ? ` (scanning ${leadScanner.listMailboxes().map((b) => b.address).join(', ')})` : ' (follow-ups only; no mailboxes configured)'}`);
 }
 
 // ====== EMAIL AUTOMATION (Phase 5, Task 4) ======

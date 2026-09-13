@@ -158,6 +158,7 @@ const LeadSchema = z.object({
     title: z.string(),
     end_client: z.string().describe('The company the role is actually with, if different from the recruiter\'s firm.'),
     location: z.string(),
+    work_arrangement: z.string().describe('Remote, On-site, Hybrid, or empty if not stated.'),
     employment_type: z.string().describe('e.g. Contract, C2C, W2, Full-time, Contract-to-hire'),
     rate_or_salary: z.string(),
     description: z.string().describe('The job description as written in the email, lightly cleaned. Empty if none.'),
@@ -216,6 +217,11 @@ function leadFromExtraction(msg, box, ex) {
     job_location: j.location || '',
     job_description: j.description || '',
     rate_or_salary: j.rate_or_salary || '',
+    end_client: j.end_client || '',
+    employment_type: j.employment_type || '',
+    work_arrangement: j.work_arrangement || (/\bremote\b/i.test(`${j.location} ${msg.subject}`) ? 'Remote' : /\bhybrid\b/i.test(`${j.location} ${msg.subject}`) ? 'Hybrid' : /\bon-?site\b/i.test(`${j.location} ${msg.subject}`) ? 'On-site' : ''),
+    workflow_status: 'new',
+    origin: 'system',
     notes: notesParts.join('\n'),
     mailbox: box.address,
     message_id: msg.message_id,
@@ -257,6 +263,22 @@ async function scanMailboxes(deps) {
         const seen = await pool.query('SELECT id FROM email_scan_log WHERE message_id=$1', [msg.message_id]);
         if (seen.rows.length) { r.already_scanned += 1; continue; }
         summary.messages_scanned += 1;
+
+        // A message from a recruiter we have already written to is a reply
+        // in the offer workflow, not a new lead.
+        const fromEmail = String(msg.from_email || '').toLowerCase();
+        if (fromEmail) {
+          const open = await pool.query("SELECT * FROM leads WHERE LOWER(email)=$1 AND workflow_status IN ('replied','awaiting_info') ORDER BY id LIMIT 1", [fromEmail]);
+          if (open.rows.length) {
+            const outcome = await (deps.handleInbound || module.exports.handleInboundReply)(pool, open.rows[0], msg);
+            r.replies_handled = (r.replies_handled || 0) + 1;
+            summary.replies_handled = (summary.replies_handled || 0) + 1;
+            await pool.query(
+              'INSERT INTO email_scan_log (mailbox, message_id, subject, from_email, received_at, classification, reason, lead_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+              [box.address, msg.message_id, msg.subject, msg.from_email, msg.received_at || null, 'lead_reply', outcome.action, open.rows[0].id]);
+            continue;
+          }
+        }
 
         const pf = prefilter(msg);
         let classification = 'not_recruiter';
@@ -313,4 +335,8 @@ async function scanMailboxes(deps) {
   return summary;
 }
 
-module.exports = { listMailboxes, publicMailboxes, fetchGraphMessages, fetchImapMessages, prefilter, classifyMessage, leadFromExtraction, scanMailboxes, htmlToText, isLeadAIConfigured, MODEL, _setClientForTests };
+module.exports = {
+  listMailboxes, publicMailboxes, fetchGraphMessages, fetchImapMessages, prefilter, classifyMessage, leadFromExtraction, scanMailboxes, htmlToText, isLeadAIConfigured, MODEL, _setClientForTests,
+  // Reply handling lives in lead-workflow.js; resolved lazily so tests can swap it.
+  handleInboundReply: (pool, lead, msg) => require('./lead-workflow').handleInboundReply(pool, lead, msg),
+};
