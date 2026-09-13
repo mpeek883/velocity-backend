@@ -9,6 +9,8 @@ const multer = require('multer');
 const { extractText, parseResumeText } = require('./resume-parser');
 const { extractCandidateWithAI, isAIConfigured } = require('./resume-ai');
 const { getApolloClient, isApolloConfigured, ApolloError } = require('./apollo-client');
+const { sendEmail, isEmailConfigured, emailTransportName, textToHtml, FROM_EMAIL } = require('./email');
+const { runAssistantChat, isAIConfigured: isAssistantConfigured } = require('./assistant');
 
 // Resume uploads are held in memory (never written to disk) and capped at 5 MB.
 const resumeUpload = multer({
@@ -672,6 +674,96 @@ function startApolloSyncScheduler() {
   console.log(`🔄 Apollo job sync scheduled every ${APOLLO_SYNC_INTERVAL_MIN} min`);
 }
 
+// ====== EMAIL AUTOMATION (Phase 5, Task 4) ======
+// Backs the app's Email Templates (candidate outreach), Smart Paste / Email
+// Scanner extraction (via the AI chat route), NDA send, and interview reminders.
+
+function sendMailError(res, err) {
+  res.status(err.status || 502).json({ error: err.message, code: err.code });
+}
+
+app.get('/api/email/status', authenticateToken, (req, res) => {
+  res.json({ configured: isEmailConfigured(), transport: emailTransportName(), from: FROM_EMAIL });
+});
+
+// Generic send: { to, subject, body (plain text) | html }
+app.post('/api/email/send', authenticateToken, async (req, res) => {
+  try {
+    const { to, subject, body, html } = req.body || {};
+    const result = await sendEmail({ to, subject, html, text: body });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    sendMailError(res, err);
+  }
+});
+
+// NDA / cover-note send used by the app's candidate email modal and NDA workflow.
+// Sends the cover note and records a contract row so the send is tracked.
+app.post('/api/nda/send', authenticateToken, async (req, res) => {
+  try {
+    const { deal_name, deal_value, client_company, client_signatory, signer_email, cover_note, subject, record_contract = true } = req.body || {};
+    if (!signer_email) return res.status(400).json({ error: 'Signer email required' });
+    const signerFirst = (client_signatory || '').split(' ')[0] || 'Team';
+    const emailBody = cover_note || `Dear ${signerFirst},\n\nPlease find attached a Mutual NDA from Peek IT Services for your review in connection with ${deal_name || 'our engagement'}.\n\nBest regards,\nPeek IT Services`;
+    const result = await sendEmail({
+      to: signer_email,
+      subject: subject || `Mutual NDA for Review - ${deal_name || client_company || 'Peek IT Services'}`,
+      html: textToHtml(emailBody),
+      text: emailBody,
+    });
+    let contract = null;
+    if (record_contract) {
+      const value = parseFloat(String(deal_value || '').replace(/[^0-9.]/g, '')) || null;
+      const ins = await pool.query(
+        'INSERT INTO contracts (type, status, value) VALUES ($1, $2, $3) RETURNING *',
+        ['nda-mutual', 'Under Review', value]
+      );
+      contract = ins.rows[0];
+    }
+    res.json({ ok: true, ...result, contract });
+  } catch (err) {
+    sendMailError(res, err);
+  }
+});
+
+// Interview reminder to a submitted candidate.
+app.post('/api/submissions/:id/remind', authenticateToken, async (req, res) => {
+  try {
+    const q = await pool.query(
+      `SELECT s.id, s.status, c.name AS candidate_name, c.email AS candidate_email, j.title AS job_title, j.company AS company
+       FROM submissions s
+       LEFT JOIN candidates c ON c.id = s.candidate_id
+       LEFT JOIN job_orders j ON j.id = s.job_order_id
+       WHERE s.id = $1`, [req.params.id]);
+    if (!q.rows.length) return res.status(404).json({ error: 'Submission not found' });
+    const s = q.rows[0];
+    const { to, message } = req.body || {};
+    const recipient = to || s.candidate_email;
+    if (!recipient) return res.status(400).json({ error: 'Candidate has no email address; pass "to" explicitly' });
+    const first = (s.candidate_name || 'there').split(' ')[0];
+    const text = `Hi ${first},\n\n${message || `This is a reminder about your upcoming interview for the ${s.job_title || 'open'} role${s.company ? ` at ${s.company}` : ''}. Please reach out if you have any questions.`}\n\nBest regards,\nPeek IT Services`;
+    const result = await sendEmail({
+      to: recipient,
+      subject: `Interview Reminder - ${s.job_title || 'Your submission'}${s.company ? ` at ${s.company}` : ''} | Peek IT`,
+      text,
+    });
+    res.json({ ok: true, ...result, to: recipient });
+  } catch (err) {
+    sendMailError(res, err);
+  }
+});
+
+// AI assistant + Smart Paste extraction: { message, module, userRole, history } -> { response }
+app.post('/api/ai/chat', authenticateToken, async (req, res) => {
+  try {
+    if (!isAssistantConfigured()) return res.status(503).json({ error: 'AI not configured (ANTHROPIC_API_KEY missing)', code: 'AI_NOT_CONFIGURED' });
+    const result = await runAssistantChat(req.body || {});
+    res.json(result);
+  } catch (err) {
+    res.status(err.status || 502).json({ error: err.message || 'AI request failed', code: err.code });
+  }
+});
+
 // SUBMISSIONS
 app.get('/api/submissions', authenticateToken, async (req, res) => {
   try {
@@ -841,7 +933,13 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
 
 // ====== HEALTH CHECK ======
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'OK', timestamp: new Date().toISOString() });
+  res.json({
+    status: 'OK',
+    timestamp: new Date().toISOString(),
+    ai: isAssistantConfigured(),
+    email: emailTransportName(),
+    apollo: isApolloConfigured(),
+  });
 });
 
 app.get('/', (req, res) => {
