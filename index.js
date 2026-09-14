@@ -1484,6 +1484,19 @@ app.post('/api/leads/scan/forget', authenticateToken, async (req, res) => {
     res.json({ forgotten: q.rows.length, email });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+// What the scanner decided about each email, per mailbox (subjects and senders only; no bodies).
+app.get('/api/leads/scan/log', authenticateToken, async (req, res) => {
+  try {
+    const params = []; const where = [];
+    if (req.query.mailbox) { params.push(String(req.query.mailbox).toLowerCase()); where.push(`LOWER(mailbox)=$${params.length}`); }
+    if (req.query.classification) { params.push(String(req.query.classification)); where.push(`classification=$${params.length}`); }
+    const w = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const summary = await pool.query(`SELECT mailbox, classification, COUNT(*) AS n, MAX(received_at) AS newest FROM email_scan_log ${w} GROUP BY mailbox, classification ORDER BY mailbox, n DESC`, params);
+    params.push(Math.min(Number(req.query.limit) || 100, 500));
+    const rows = await pool.query(`SELECT mailbox, subject, from_email, received_at, classification, reason, lead_id, scanned_at FROM email_scan_log ${w} ORDER BY received_at DESC NULLS LAST LIMIT $${params.length}`, params);
+    res.json({ summary: summary.rows.map((r) => ({ ...r, n: Number(r.n) })), rows: rows.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 app.post('/api/leads/scan', authenticateToken, async (req, res) => {
   try {
     if (!leadScanner.isLeadAIConfigured()) return res.status(503).json({ error: 'AI not configured (ANTHROPIC_API_KEY missing)', code: 'AI_NOT_CONFIGURED' });
