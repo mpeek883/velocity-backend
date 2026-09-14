@@ -389,6 +389,10 @@ async function ensureSchema() {
     "UPDATE leads SET origin='system' WHERE origin IS NULL AND message_id IS NOT NULL",
     "UPDATE leads SET origin='manual' WHERE origin IS NULL",
     "UPDATE contacts SET contact_type='Company' WHERE contact_type IS NULL",
+    // Leads that were already written to keep "new" only until the first outbound message.
+    "UPDATE leads SET status='contacted' WHERE COALESCE(status,'new')='new' AND (replied_at IS NOT NULL OR workflow_status IN ('replied','awaiting_info','ready_to_authorize','declined','closed_no_response') OR id::text IN (SELECT lead_id FROM lead_emails WHERE direction='outbound'))",
+    "UPDATE leads SET status='converted' WHERE workflow_status='opportunity_created' AND COALESCE(status,'new') IN ('new','contacted')",
+    "UPDATE leads SET status='personal' WHERE workflow_status='personal_interest' AND COALESCE(status,'new') IN ('new','contacted')",
     // The first user of a database is the admin until roles are assigned.
     "UPDATE users SET role='admin' WHERE role IS NULL AND id = (SELECT MIN(id) FROM users)",
   ];

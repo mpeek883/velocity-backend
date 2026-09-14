@@ -172,6 +172,9 @@ async function sendLeadEmail(pool, lead, { kind, subject, body, status, extra = 
   await logEmail(pool, lead, { direction: 'outbound', kind, subject, body: fullBody, to_email: lead.email, from_email: FROM_EMAIL });
   const now = new Date();
   const fields = { workflow_status: status, ...extra };
+  // Any outbound communication means the lead has been worked: "new" is only
+  // for leads that just dropped in from a scan or have not been touched yet.
+  if (!fields.status && ['new', '', null, undefined].includes(lead.status)) fields.status = 'contacted';
   if (kind === 'offer_reply') { fields.replied_at = now; fields.follow_up_due_at = addBusinessDays(now, FOLLOW_UP_BUSINESS_DAYS); }
   if (kind === 'info_request') { fields.follow_up_due_at = addBusinessDays(now, FOLLOW_UP_BUSINESS_DAYS); }
   if (kind === 'close_out') { fields.follow_up_due_at = null; }
@@ -247,35 +250,37 @@ async function handleInboundReply(pool, lead, msg, options = {}) {
   if (p.work_arrangement) updates.work_arrangement = p.work_arrangement;
   let current = await setLead(pool, lead.id, updates);
 
+  // The recruiter's answer drives the visible lead status: interested ->
+  // qualified, not interested -> unqualified, unclear -> stays contacted.
   if (analysis.interest === 'not_interested') {
     const mail = closeOutEmail(current);
-    const r = await sendLeadEmail(pool, current, { kind: 'close_out', ...mail, status: 'declined' }, options);
+    const r = await sendLeadEmail(pool, current, { kind: 'close_out', ...mail, status: 'declined', extra: { status: 'unqualified' } }, options);
     return { action: 'declined_close_out_sent', lead: r.lead, analysis };
   }
   if (analysis.interest === 'interested') {
     const missing = missingInfo(current);
     if (missing.length) {
       const mail = followUpRequestEmail(current, missing);
-      const r = await sendLeadEmail(pool, current, { kind: 'info_request', ...mail, status: 'awaiting_info', extra: { missing_info: JSON.stringify(missing.map((m) => m.key)) } }, options);
+      const r = await sendLeadEmail(pool, current, { kind: 'info_request', ...mail, status: 'awaiting_info', extra: { missing_info: JSON.stringify(missing.map((m) => m.key)), status: 'qualified' } }, options);
       return { action: 'info_requested', lead: r.lead, missing, analysis };
     }
     if (process.env.LEAD_AUTO_CONVERT === 'true') {
       // Legacy behaviour: convert without a human checkpoint.
       const opp = await createOpportunityFromLead(pool, current, analysis);
-      current = await setLead(pool, current.id, { workflow_status: 'opportunity_created', opportunity_id: String(opp.id), follow_up_due_at: null, missing_info: '[]' });
+      current = await setLead(pool, current.id, { workflow_status: 'opportunity_created', status: 'converted', opportunity_id: String(opp.id), follow_up_due_at: null, missing_info: '[]' });
       if (module.exports.onLeadUpdated) { try { await module.exports.onLeadUpdated(current); } catch { /* mirror is best-effort */ } }
       return { action: 'opportunity_created', lead: current, opportunity: opp, analysis };
     }
     // Authorize Search checkpoint: the recruiter is interested and every
     // critical detail is on file, so a person now decides whether to open the
     // search. Nothing is created until POST /api/leads/:id/authorize-search.
-    current = await setLead(pool, current.id, { workflow_status: 'ready_to_authorize', follow_up_due_at: null, missing_info: '[]' });
+    current = await setLead(pool, current.id, { workflow_status: 'ready_to_authorize', status: 'qualified', follow_up_due_at: null, missing_info: '[]' });
     if (module.exports.onReadyToAuthorize) { try { await module.exports.onReadyToAuthorize(current, analysis); } catch (e) { console.error('⚠️ ready-to-authorize hook failed:', e.message); } }
     if (module.exports.onLeadUpdated) { try { await module.exports.onLeadUpdated(current); } catch { /* mirror is best-effort */ } }
     return { action: 'ready_to_authorize', lead: current, analysis };
   }
-  // Unclear: keep waiting, but give them another window.
-  current = await setLead(pool, current.id, { follow_up_due_at: addBusinessDays(new Date(), FOLLOW_UP_BUSINESS_DAYS) });
+  // Unclear: keep waiting, but give them another window; the lead stays contacted.
+  current = await setLead(pool, current.id, { follow_up_due_at: addBusinessDays(new Date(), FOLLOW_UP_BUSINESS_DAYS), ...(['new', '', null, undefined].includes(current.status) ? { status: 'contacted' } : {}) });
   return { action: 'unclear_waiting', lead: current, analysis };
 }
 
