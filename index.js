@@ -73,6 +73,12 @@ const REQUIRED_COLUMNS = {
     created_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP', updated_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
   },
   users: { name: 'VARCHAR(255)', role: 'VARCHAR(50)', is_active: 'BOOLEAN DEFAULT TRUE', takes_leads: 'BOOLEAN DEFAULT TRUE', last_assigned_at: 'TIMESTAMP' },
+  job_orders: { opportunity_id: 'TEXT', account_id: 'TEXT', priority: 'VARCHAR(20)', target_fill_date: 'DATE', required_skills: 'TEXT' },
+  activities: {
+    type: 'VARCHAR(50)', title: 'VARCHAR(255)', contact: 'VARCHAR(255)', account: 'VARCHAR(255)', due_at: 'TIMESTAMP', status: "VARCHAR(50) DEFAULT 'pending'", duration: 'VARCHAR(50)', notes: 'TEXT',
+    lead_id: 'TEXT', opportunity_id: 'TEXT', account_id: 'TEXT', contact_id: 'TEXT', candidate_id: 'TEXT', created_by: 'TEXT', completed_at: 'TIMESTAMP',
+    created_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP', updated_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+  },
   mail_connections: { host: 'VARCHAR(255)', port: 'INTEGER', username: 'VARCHAR(255)', secret: 'TEXT' },
 };
 
@@ -121,6 +127,7 @@ const LINK_COLUMNS = [
   ['contacts', 'candidate_id'], ['contacts', 'lead_id'], ['contacts', 'account_id'],
   ['lead_emails', 'lead_id'], ['email_scan_log', 'lead_id'],
   ['candidate_matches', 'target_id'], ['candidate_matches', 'candidate_id'],
+  ['job_orders', 'opportunity_id'], ['job_orders', 'account_id'], ['activities', 'lead_id'], ['activities', 'opportunity_id'], ['activities', 'account_id'], ['activities', 'contact_id'], ['activities', 'candidate_id'],
 ];
 async function reconcileLinkColumns() {
   const tables = [...new Set(LINK_COLUMNS.map(([t]) => t))];
@@ -307,6 +314,26 @@ async function ensureSchema() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       UNIQUE (provider, address)
+    )`,
+    `CREATE TABLE IF NOT EXISTS activities (
+      id SERIAL PRIMARY KEY,
+      type VARCHAR(50),
+      title VARCHAR(255),
+      contact VARCHAR(255),
+      account VARCHAR(255),
+      due_at TIMESTAMP,
+      status VARCHAR(50) DEFAULT 'pending',
+      duration VARCHAR(50),
+      notes TEXT,
+      lead_id TEXT,
+      opportunity_id TEXT,
+      account_id TEXT,
+      contact_id TEXT,
+      candidate_id TEXT,
+      created_by TEXT,
+      completed_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`,
     `CREATE TABLE IF NOT EXISTS candidate_matches (
       id SERIAL PRIMARY KEY,
@@ -500,15 +527,16 @@ function sendDbError(res, err) {
 
 const CANDIDATE_COLS  = ['name', 'email', 'phone', 'title', 'company', 'location', 'skills', 'source', 'status',
                          'linkedin', 'experience_years', 'work_auth', 'availability', 'availability_date', 'desired_rate', 'desired_salary', 'resume_text', 'notes'];
-const JOB_ORDER_COLS  = ['title', 'company', 'location', 'description', 'salary_min', 'salary_max', 'salary_range', 'status',
+const JOB_ORDER_COLS  = ['title', 'company', 'location', 'description', 'salary_min', 'salary_max', 'salary_range', 'status', 'opportunity_id', 'account_id', 'priority', 'target_fill_date', 'required_skills',
                          'source', 'url', 'apollo_job_id', 'apollo_org_id', 'posted_at', 'last_seen_at', 'last_synced_at'];
 const SUBMISSION_COLS = ['candidate_id', 'job_order_id', 'status', 'notes'];
 const LEAD_COLS       = ['name', 'title', 'company', 'company_address', 'company_website', 'email', 'phone', 'linkedin', 'source', 'status', 'territory', 'score',
                          'job_title', 'job_location', 'job_description', 'rate_or_salary', 'notes',
                          'end_client', 'employment_type', 'work_arrangement', 'workflow_status', 'email_subject', 'email_from', 'email_body', 'email_received_at'];
 const OPP_COLS        = ['name', 'account', 'contact', 'contact_email', 'value', 'stage', 'probability', 'close_date', 'type', 'competitor', 'notes', 'forecast_category', 'win_loss_reason',
-                         'job_title', 'job_description', 'client_name', 'rate', 'work_location', 'work_arrangement', 'lead_id'];
+                         'job_title', 'job_description', 'client_name', 'rate', 'work_location', 'work_arrangement', 'lead_id', 'account_id'];
 const PLACEMENT_COLS  = ['submission_id', 'candidate_id', 'job_order_id', 'start_date', 'end_date', 'fee_amount', 'placement_status'];
+const ACTIVITY_COLS   = ['type', 'title', 'contact', 'account', 'due_at', 'status', 'duration', 'notes', 'lead_id', 'opportunity_id', 'account_id', 'contact_id', 'candidate_id'];
 
 // ====== MIDDLEWARE ======
 app.use(helmet());
@@ -903,7 +931,15 @@ app.post('/api/candidates/parse-resume', authenticateToken, (req, res) => {
 app.get('/api/job-orders', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM job_orders ORDER BY created_at DESC');
-    res.json(result.rows);
+    const rows = result.rows;
+    // Attach the O-number of the opportunity each job order came from.
+    const ids = [...new Set(rows.map((r) => r.opportunity_id).filter(Boolean).map(String))];
+    if (ids.length) {
+      const opps = await pool.query('SELECT id, opportunity_no, name FROM opportunities WHERE id::text = ANY($1)', [ids]);
+      const byId = new Map(opps.rows.map((o) => [String(o.id), o]));
+      for (const r of rows) { const o = byId.get(String(r.opportunity_id)); if (o) { r.opportunity_no = o.opportunity_no; r.opportunity_name = o.name; } }
+    }
+    res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1569,6 +1605,33 @@ Resume link: ${hit.resume_link}` : ''}`,
   } catch (err) { sendDbError(res, err); }
 });
 
+// ---- Opportunity -> Job Order hand-off ----
+// The confirmed deal becomes the role to fill. Fields carry over and the job
+// order keeps the opportunity's id (and O-number) so the chain is visible.
+app.post('/api/opportunities/:id/job-order', authenticateToken, async (req, res) => {
+  try {
+    const q = await pool.query('SELECT * FROM opportunities WHERE id::text=$1', [String(req.params.id)]);
+    if (!q.rows.length) return res.status(404).json({ error: 'Opportunity not found' });
+    const o = q.rows[0];
+    const existing = await pool.query('SELECT * FROM job_orders WHERE opportunity_id=$1 ORDER BY id LIMIT 1', [String(o.id)]);
+    if (existing.rows.length && !(req.body && req.body.allow_duplicate)) return res.status(409).json({ code: 'DUPLICATE', error: `A job order already exists for this opportunity ("${existing.rows[0].title}").`, existing: existing.rows[0] });
+    const b = req.body || {};
+    const body = {
+      title: b.title || o.job_title || o.name, company: b.company || o.client_name || o.account || '', location: b.location || o.work_location || o.work_arrangement || '',
+      description: b.description || o.job_description || o.notes || '', salary_range: b.salary_range || o.rate || (o.value != null ? String(o.value) : ''),
+      status: b.status || 'open', priority: b.priority || 'High', opportunity_id: String(o.id), account_id: o.account_id ? String(o.account_id) : null,
+      source: 'Opportunity',
+    };
+    const row = await insertRow('job_orders', JOB_ORDER_COLS, body);
+    if (String(o.stage || '').toLowerCase() === 'prospecting' || String(o.stage || '').toLowerCase() === 'qualification') {
+      await pool.query("UPDATE opportunities SET stage='Proposal', updated_at=CURRENT_TIMESTAMP WHERE id::text=$1", [String(o.id)]).catch(() => {});
+    }
+    await pool.query('INSERT INTO activities (type, title, account, opportunity_id, account_id, status, completed_at, created_by) VALUES ($1,$2,$3,$4,$5,$6,CURRENT_TIMESTAMP,$7)',
+      ['Task', `Job order created: ${body.title}`, body.company, String(o.id), body.account_id, 'completed', String(req.user.id)]).catch(() => {});
+    res.status(201).json({ ...row, opportunity_no: o.opportunity_no, opportunity_name: o.name });
+  } catch (err) { sendDbError(res, err); }
+});
+
 // ---- AI candidate matching ----
 async function runMatch(targetKind, id, body = {}) {
   let target;
@@ -1864,10 +1927,137 @@ app.get('/api/placements', authenticateToken, async (req, res) => {
 
 app.post('/api/placements', authenticateToken, async (req, res) => {
   try {
-    res.status(201).json(await insertRow('placements', PLACEMENT_COLS, req.body));
+    const body = { ...(req.body || {}) };
+    // A placement made from a submission fills in the candidate and job order
+    // and marks the submission as hired, so the chain is recorded.
+    let sub = null;
+    if (body.submission_id) {
+      const q = await pool.query('SELECT * FROM submissions WHERE id::text=$1', [String(body.submission_id)]);
+      if (!q.rows.length) return res.status(404).json({ error: 'Submission not found' });
+      sub = q.rows[0];
+      if (!body.candidate_id) body.candidate_id = sub.candidate_id;
+      if (!body.job_order_id) body.job_order_id = sub.job_order_id;
+    }
+    const row = await insertRow('placements', PLACEMENT_COLS, body);
+    if (sub) {
+      await pool.query("UPDATE submissions SET status='hired', updated_at=CURRENT_TIMESTAMP WHERE id=$1", [sub.id]).catch(() => {});
+      await pool.query("UPDATE job_orders SET status='filled', updated_at=CURRENT_TIMESTAMP WHERE id=$1 AND COALESCE(status,'open') NOT IN ('filled','closed','cancelled')", [sub.job_order_id]).catch(() => {});
+      await pool.query("UPDATE candidates SET status='placed', updated_at=CURRENT_TIMESTAMP WHERE id=$1", [sub.candidate_id]).catch(() => {});
+    }
+    res.status(201).json(row);
   } catch (err) {
     sendDbError(res, err);
   }
+});
+
+// ---- Activities: calls, emails, meetings, tasks against a lead / deal / account ----
+app.get('/api/activities', authenticateToken, async (req, res) => {
+  try {
+    const where = []; const params = [];
+    for (const k of ['opportunity_id', 'lead_id', 'account_id', 'candidate_id']) if (req.query[k]) { params.push(String(req.query[k])); where.push(`${k}=$${params.length}`); }
+    const q = await pool.query(`SELECT * FROM activities${where.length ? ' WHERE ' + where.join(' AND ') : ''} ORDER BY COALESCE(due_at, created_at) DESC, id DESC`, params);
+    res.json(q.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.post('/api/activities', authenticateToken, async (req, res) => {
+  try {
+    const b = { ...(req.body || {}) };
+    if (!b.title) return res.status(400).json({ error: 'title is required' });
+    // Fill the display names from the linked records when only ids were sent.
+    if (b.opportunity_id && !b.account) { const o = await pool.query('SELECT account, contact, account_id FROM opportunities WHERE id::text=$1', [String(b.opportunity_id)]); if (o.rows[0]) { b.account = o.rows[0].account || ''; b.contact = b.contact || o.rows[0].contact || ''; b.account_id = b.account_id || o.rows[0].account_id; } }
+    if (b.lead_id && !b.contact) { const l = await pool.query('SELECT name, company, account_id FROM leads WHERE id::text=$1', [String(b.lead_id)]); if (l.rows[0]) { b.contact = l.rows[0].name || ''; b.account = b.account || l.rows[0].company || ''; b.account_id = b.account_id || l.rows[0].account_id; } }
+    if (b.due_at === '') b.due_at = null;
+    const row = await insertRow('activities', [...ACTIVITY_COLS, 'created_by'], { ...b, created_by: String(req.user.id) });
+    res.status(201).json(row);
+  } catch (err) { sendDbError(res, err); }
+});
+app.put('/api/activities/:id', authenticateToken, async (req, res) => {
+  try {
+    const b = { ...(req.body || {}) };
+    if (b.status === 'completed') b.completed_at = new Date();
+    if (b.due_at === '') b.due_at = null;
+    const row = await updateRow('activities', [...ACTIVITY_COLS, 'completed_at'], req.params.id, b);
+    if (!row) return res.status(404).json({ error: 'Activity not found' });
+    res.json(row);
+  } catch (err) { sendDbError(res, err); }
+});
+app.delete('/api/activities/:id', authenticateToken, async (req, res) => {
+  try {
+    const q = await pool.query('DELETE FROM activities WHERE id=$1 RETURNING id', [req.params.id]);
+    if (!q.rows.length) return res.status(404).json({ error: 'Activity not found' });
+    res.json({ message: 'Deleted' });
+  } catch (err) { sendDbError(res, err); }
+});
+
+// ---- Reports: sales analytics and the staffing scoreboard (computed from the tables) ----
+const num = (v) => (v == null || v === '' ? 0 : Number(v) || 0);
+const monthKey = (d) => { const x = new Date(d); return `${x.getUTCFullYear()}-${String(x.getUTCMonth() + 1).padStart(2, '0')}`; };
+const lastMonths = (n) => { const out = []; const now = new Date(); for (let i = n - 1; i >= 0; i--) { const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1)); out.push({ key: monthKey(d), label: d.toLocaleString('en-US', { month: 'short', timeZone: 'UTC' }) }); } return out; };
+app.get('/api/analytics', authenticateToken, async (req, res) => {
+  try {
+    const [opps, leads, acts, users] = await Promise.all([
+      pool.query('SELECT * FROM opportunities'), pool.query('SELECT * FROM leads'), pool.query('SELECT * FROM activities'), pool.query('SELECT id, name, email FROM users'),
+    ]);
+    const open = opps.rows.filter((o) => !['closed won', 'closed lost'].includes(String(o.stage || '').toLowerCase()));
+    const won = opps.rows.filter((o) => String(o.stage || '').toLowerCase() === 'closed won');
+    const lost = opps.rows.filter((o) => String(o.stage || '').toLowerCase() === 'closed lost');
+    const year = new Date().getUTCFullYear();
+    const byStage = {}; for (const o of opps.rows) { const k = o.stage || 'Unknown'; byStage[k] = byStage[k] || { stage: k, count: 0, value: 0 }; byStage[k].count += 1; byStage[k].value += num(o.value); }
+    const activeLeads = leads.rows.filter((l) => !['unqualified'].includes(String(l.status || '').toLowerCase()) && !['declined', 'closed_no_response', 'opportunity_created'].includes(String(l.workflow_status || '')));
+    const bySource = {}; for (const l of leads.rows) { const k = l.source || 'Unknown'; bySource[k] = (bySource[k] || 0) + 1; }
+    const userName = new Map(users.rows.map((u) => [String(u.id), u.name || u.email]));
+    const byOwner = {}; for (const l of leads.rows) { const k = l.assigned_to ? (userName.get(String(l.assigned_to)) || `User ${l.assigned_to}`) : 'Unassigned'; byOwner[k] = (byOwner[k] || 0) + 1; }
+    const byWorkflow = {}; for (const l of leads.rows) { const k = l.workflow_status || 'new'; byWorkflow[k] = (byWorkflow[k] || 0) + 1; }
+    const replied = leads.rows.filter((l) => l.replied_at && l.created_at);
+    const avgHoursToReply = replied.length ? Math.round(replied.reduce((s, l) => s + (new Date(l.replied_at) - new Date(l.created_at)) / 36e5, 0) / replied.length * 10) / 10 : null;
+    const converted = leads.rows.filter((l) => l.opportunity_id).length;
+    const byType = {}; for (const a of acts.rows) { const k = a.type || 'Other'; byType[k] = (byType[k] || 0) + 1; }
+    const months = lastMonths(6);
+    const monthly = months.map((m) => ({ month: m.label, key: m.key, leads: leads.rows.filter((l) => l.created_at && monthKey(l.created_at) === m.key).length, opportunities: opps.rows.filter((o) => o.created_at && monthKey(o.created_at) === m.key).length, closed_won_value: won.filter((o) => (o.close_date || o.updated_at) && monthKey(o.close_date || o.updated_at) === m.key).reduce((s, o) => s + num(o.value), 0) }));
+    res.json({
+      pipeline: open.reduce((s, o) => s + num(o.value), 0),
+      closedWon: won.filter((o) => new Date(o.close_date || o.updated_at || o.created_at).getUTCFullYear() === year).reduce((s, o) => s + num(o.value), 0),
+      closedWonCount: won.length, closedLostCount: lost.length, openCount: open.length,
+      winRate: won.length + lost.length ? Math.round((won.length / (won.length + lost.length)) * 100) : null,
+      activeLeads: activeLeads.length, totalLeads: leads.rows.length,
+      activities: acts.rows.length, openActivities: acts.rows.filter((a) => a.status !== 'completed').length,
+      byStage: Object.values(byStage), leadsBySource: Object.entries(bySource).map(([source, count]) => ({ source, count })), leadsByOwner: Object.entries(byOwner).map(([owner, count]) => ({ owner, count })),
+      leadsByWorkflow: Object.entries(byWorkflow).map(([status, count]) => ({ status, count })), avgHoursToReply,
+      conversion: { leads: leads.rows.length, opportunities: converted, rate: leads.rows.length ? Math.round((converted / leads.rows.length) * 100) : 0 },
+      activitiesByType: Object.entries(byType).map(([type, count]) => ({ type, count })), monthly,
+      generated_at: new Date().toISOString(),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.get('/api/staffing/dashboard', authenticateToken, async (req, res) => {
+  try {
+    const [cands, jobs, subs, places] = await Promise.all([pool.query('SELECT * FROM candidates'), pool.query('SELECT * FROM job_orders'), pool.query('SELECT * FROM submissions'), pool.query('SELECT * FROM placements')]);
+    const now = new Date(); const thisMonth = monthKey(now); const year = now.getUTCFullYear();
+    const openJobs = jobs.rows.filter((j) => !['filled', 'closed', 'cancelled'].includes(String(j.status || 'open').toLowerCase()));
+    const cap = (s) => { const t = String(s || 'active').toLowerCase(); return t.charAt(0).toUpperCase() + t.slice(1); };
+    const candByStatus = {}; for (const c of cands.rows) { const k = cap(c.status); candByStatus[k] = (candByStatus[k] || 0) + 1; }
+    const stageName = (s) => { const t = String(s || 'submitted').toLowerCase(); return ({ submitted: 'Submitted', identified: 'Identified', 'phone screen': 'Phone Screen', screening: 'Phone Screen', technical: 'Technical', interview: 'Hiring Manager', 'hiring manager': 'Hiring Manager', 'final round': 'Final Round', offer: 'Offer', hired: 'Placed', placed: 'Placed', rejected: 'Rejected', withdrew: 'Withdrew', withdrawn: 'Withdrew' })[t] || cap(t); };
+    const subsByStage = {}; for (const s of subs.rows) { const k = stageName(s.status); subsByStage[k] = (subsByStage[k] || 0) + 1; }
+    const placedThisMonth = places.rows.filter((p) => p.start_date && monthKey(p.start_date) === thisMonth);
+    const jobById = new Map(jobs.rows.map((j) => [String(j.id), j]));
+    const clients = {}; for (const j of openJobs) { const k = j.company || 'Unknown'; clients[k] = (clients[k] || 0) + 1; }
+    const urgent = openJobs.filter((j) => ['critical', 'high'].includes(String(j.priority || '').toLowerCase()) || (j.target_fill_date && (new Date(j.target_fill_date) - now) < 14 * 86400000))
+      .sort((a, b) => new Date(a.target_fill_date || '2099-01-01') - new Date(b.target_fill_date || '2099-01-01')).slice(0, 8)
+      .map((j) => ({ id: j.id, title: j.title, account: j.company, priority: j.priority || 'High', target_fill_date: j.target_fill_date }));
+    const skills = {}; for (const c of cands.rows) for (const sk of String(c.skills || '').split(',').map((x) => x.trim()).filter(Boolean)) skills[sk] = (skills[sk] || 0) + 1;
+    res.json({
+      openJobs: openJobs.length, totalJobs: jobs.rows.length, candidates: cands.rows.length,
+      placementsThisMonth: { count: placedThisMonth.length, fees: placedThisMonth.reduce((s, p) => s + num(p.fee_amount), 0) },
+      feeYTD: places.rows.filter((p) => p.start_date && new Date(p.start_date).getUTCFullYear() === year).reduce((s, p) => s + num(p.fee_amount), 0),
+      placementsTotal: places.rows.length, activePlacements: places.rows.filter((p) => String(p.placement_status || 'active').toLowerCase() === 'active').length,
+      submissionsByStage: Object.entries(subsByStage).map(([stage, count]) => ({ stage, count })), submissionsTotal: subs.rows.length,
+      candidatesByStatus: Object.entries(candByStatus).map(([status, count]) => ({ status, count })),
+      topClients: Object.entries(clients).map(([account, open_jobs]) => ({ account, open_jobs })).sort((a, b) => b.open_jobs - a.open_jobs).slice(0, 6),
+      urgentJobs: urgent, topSkills: Object.entries(skills).map(([skill, count]) => ({ skill, count })).sort((a, b) => b.count - a.count).slice(0, 10),
+      funnel: { candidates: cands.rows.length, submissions: subs.rows.length, placements: places.rows.length, fill_rate: jobs.rows.length ? Math.round((jobs.rows.filter((j) => String(j.status || '').toLowerCase() === 'filled').length / jobs.rows.length) * 100) : 0 },
+      jobs_with_deal: jobs.rows.filter((j) => j.opportunity_id).length, generated_at: new Date().toISOString(),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.put('/api/placements/:id', authenticateToken, async (req, res) => {
