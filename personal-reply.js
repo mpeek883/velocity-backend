@@ -57,7 +57,7 @@ function baseResumeMissing() { const e = new Error('Add your base resume under S
 function templateDraft(lead, user) {
   const first = String(lead.name || '').split(' ')[0] || 'there';
   const role = lead.job_title || 'the role';
-  const subject = `Re: ${lead.email_subject || role}`;
+  const subject = `RE: ${String(lead.email_subject || role).replace(/^\s*((re|fw|fwd)\s*:\s*)+/i, '')}`;
   const body = `Hi ${first},\n\nThank you for reaching out about the ${role}${lead.end_client ? ` with ${lead.end_client}` : ''}. I am very interested.\n\nThe role lines up closely with what I have been doing: I have led exactly this kind of work and can step in quickly. I have attached a resume tailored to the position so you can see the fit at a glance.\n\nI am available to talk this week at your convenience${lead.rate_or_salary ? `, and the ${lead.rate_or_salary} rate works for me` : ''}. Please let me know the next step.`;
   const resume_markdown = `# ${user.name || 'Brad Peek'}\n${[user.email, user.phone].filter(Boolean).join(' · ')}\n\n## Summary\n${user.headline || ''}\n\n${(user.resume_text || '').trim()}`;
   return { subject, body, fit_points: [], resume_markdown, model: 'template' };
@@ -197,10 +197,11 @@ function install(deps) {
     if (attach && !b.resume_markdown) return res.status(400).json({ error: 'resume_markdown is required when attaching the tailored resume' });
     const fullBody = `${String(b.body).trim()}\n\n${leadWorkflow.SIGNATURE}`;
     const filename = resumeFilename(user, lead);
-    const mail = { to: lead.email, bcc: leadWorkflow.LEAD_BCC || undefined, subject: b.subject, text: fullBody, html: textToHtml(fullBody) };
+    const finalSubject = lead.email_subject ? leadWorkflow.replySubject(lead, b.subject) : b.subject;
+    const mail = { to: lead.email, bcc: leadWorkflow.LEAD_BCC || undefined, subject: finalSubject, text: fullBody, html: textToHtml(fullBody), inReplyTo: lead.message_id || undefined, references: lead.message_id || undefined };
     if (attach) { mail.attachmentBuffer = await resumeDocx(b.resume_markdown, { name: user.name }); mail.attachmentFilename = filename; }
     const result = await sendEmail(mail);
-    await leadWorkflow.logEmail(pool, lead, { direction: 'outbound', kind: 'personal_reply', subject: b.subject, body: fullBody + (attach ? `\n\n[Attached: ${filename}]` : ''), to_email: lead.email });
+    await leadWorkflow.logEmail(pool, lead, { direction: 'outbound', kind: 'personal_reply', subject: finalSubject, body: fullBody + (attach ? `\n\n[Attached: ${filename}]` : ''), to_email: lead.email });
     await pool.query("UPDATE tailored_resumes SET status='sent', sent_at=CURRENT_TIMESTAMP, subject=$1, body=$2, resume_markdown=COALESCE($3, resume_markdown), updated_at=CURRENT_TIMESTAMP WHERE lead_id=$4 AND user_id=$5 AND status='draft'", [b.subject, b.body, b.resume_markdown || null, String(lead.id), String(req.user.id)]).catch(() => {});
     const updated = await leadWorkflow.setLead(pool, lead.id, { workflow_status: 'personal_interest', status: 'personal', reviewed_at: lead.reviewed_at || new Date(), replied_at: new Date(), follow_up_due_at: null, missing_info: '[]' });
     await events.record({ type: 'lead.personal_reply_sent', entity_type: 'lead', entity_id: lead.id, actor: `user:${req.user.id}`, payload: { to: lead.email, attached: attach ? filename : null, transport: result && result.transport } });

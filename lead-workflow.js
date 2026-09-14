@@ -67,14 +67,28 @@ function leadFirstName(lead) {
 }
 
 /** Deterministic fallback used when the model is unavailable. */
+/** Every reply threads on the recruiter's own subject: "RE: <their subject>" with any existing Re/Fw prefixes stripped. */
+function replySubject(lead, fallback) {
+  const base = String(lead.email_subject || fallback || lead.job_title || 'Your email').replace(/^\s*((re|fw|fwd|aw|wg)\s*:\s*)+/i, '').trim();
+  return `RE: ${base}`;
+}
+const ASK_LABEL = { job_title: 'The job title', job_description: 'The full job description', client_name: "The end client's name", rate: 'The rate being offered', work_situation: 'The work situation (remote, on-site with location, or hybrid)' };
+const COUNT_WORD = ['one', 'two', 'three', 'four', 'five'];
 function templateOfferReply(lead, missing) {
   const first = leadFirstName(lead);
-  const role = lead.job_title ? `the ${lead.job_title} role` : 'the role you are looking to fill';
+  const role = lead.job_title ? `${lead.job_title} role` : 'role you are looking to fill';
+  const where = [lead.end_client ? `supporting ${lead.end_client}` : '', lead.job_location ? `in ${lead.job_location}` : (lead.work_arrangement ? `(${lead.work_arrangement})` : '')].filter(Boolean).join(' ');
+  const wants = [
+    lead.employment_type ? `available for a ${String(lead.employment_type).toLowerCase()} engagement` : 'available now',
+    lead.work_arrangement && !/remote/i.test(lead.work_arrangement) ? `able to work ${String(lead.work_arrangement).toLowerCase()}${lead.job_location ? ` in ${lead.job_location}` : ''}` : (lead.work_arrangement ? 'comfortable working remotely' : ''),
+    'authorized to work in the US without sponsorship',
+  ].filter(Boolean).join(', ').replace(/, ([^,]*)$/, ', and $1');
+  const confirm = "If you can reply confirming you'd like our help, we'll begin sourcing right away.";
   const ask = missing.length
-    ? `\n\nTo get started, could you send over ${missing.map((m) => m.label).join(', ').replace(/, ([^,]*)$/, ', and $1')}?`
-    : '';
-  const body = `Hi ${first},\n\nThank you for your email and for considering my credentials for ${role}.\n\nWhile I am not personally available for this role, we would be happy to help you find the right resource. We work with a network of ${NETWORK_SIZE} qualified professionals and can quickly identify people who are available and interested in being considered.\n\nAs soon as we identify a match, we will send over a candidate profile for your consideration. If you or your client would like to interview the candidate, just coordinate with us and we will arrange it.${ask}\n\nWe look forward to working with you.`;
-  return { subject: `Re: ${lead.email_subject || role}`, body };
+    ? `\n\nTo target our search accurately, could you confirm ${missing.length === 1 ? 'one detail' : `${COUNT_WORD[missing.length - 1] || missing.length} details`}:\n\n${missing.map((m, i) => `${i + 1}. ${ASK_LABEL[m.key] || m.label}`).join('\n')}\n\n${confirm}`
+    : `\n\n${confirm}`;
+  const body = `Hi ${first},\n\nThank you for reaching out and for considering my credentials for the ${role}${where ? ` ${where}` : ''}.\n\nI'm not personally available for this engagement at this time, but I would be glad to leverage my placement company, Peek Talent Solutions, to help you find a qualified resource to fill it. We can work our network of ${NETWORK_SIZE} qualified professionals to identify people with the experience your client is looking for, who are ${wants}.\n\nOnce we identify a match, we'll send over a candidate profile for your consideration. If you or your client would like to interview the candidate, coordinate with us and we'll arrange the video interview.${ask}\n\nThanks again, ${first}, and I look forward to working with you.`;
+  return { subject: replySubject(lead), body };
 }
 
 /**
@@ -85,10 +99,9 @@ async function draftOfferReply(lead, options = {}) {
   if (!isAIConfigured() && !options.client) return { ...templateOfferReply(lead, missing), missing, model: 'template' };
   const client = options.client || getClient();
   const system = [
-    'You write short, warm, professional replies on behalf of Brad Peek, Managing Member of Peek Talent Solutions, a staffing firm.',
-    'A recruiter or headhunter has emailed Brad about a role. Write the reply as Brad, in plain text, no markdown, no subject line inside the body, and do not include a signature (it is appended automatically).',
-    'The reply MUST: (1) thank them for their email and for considering Brad\'s credentials for the role; (2) explain that Brad is not personally available for this role, but that Peek Talent Solutions would be happy to help them find a resource by working its network of ' + NETWORK_SIZE + ' qualified professionals to identify people who are available and interested; (3) say that once a match is identified, a candidate profile will be sent over for their consideration, and that if they or their client want to interview the candidate they can coordinate with Peek Talent Solutions to arrange it; (4) if any critical details are missing, ask for them specifically; (5) close by inviting them to confirm they would like Peek Talent Solutions\'s help.',
-    'Adapt the tone and specifics to the content of their email. Keep it under 220 words.',
+    'You write warm, specific, professional replies on behalf of Brad Peek, Managing Member of Peek Talent Solutions, a staffing firm. A recruiter or headhunter has emailed Brad about a role. Write the reply as Brad, first person, plain text, no markdown, no subject line inside the body, and no signature (it is appended automatically).',
+    'Follow this structure exactly. Paragraph 1: "Hi <first name>," then thank them for reaching out and for considering my credentials for the <role title> <supporting <program or client> in <location>> (use whatever of these their email states). Paragraph 2: "I am not personally available for this engagement at this time, but I would be glad to leverage my placement company, Peek Talent Solutions, to help you find a qualified resource to fill it." Then one sentence: "We can work our network of ' + NETWORK_SIZE + ' qualified professionals to identify <a specific profile pulled from their job description: seniority, years of experience, the two or three most important skills or tools> who are <available for the stated term or employment type>, <able to meet the stated on-site, hybrid or remote arrangement>, and <can convert or work without sponsorship>." Paragraph 3: "Once we identify a match, we will send over a candidate profile for your consideration. If you or your client would like to interview the candidate, coordinate with us and we will arrange the video interview." Paragraph 4, only if details are missing: "To target our search accurately, could you confirm <N> details:" followed by a numbered list, one line each, of exactly the missing details supplied in the context. Then: "If you can reply confirming you would like our help, we will begin sourcing right away." Final line: "Thanks again, <first name>, and I look forward to working with you." Contractions (I\'m, we\'ll, you\'d) are welcome.',
+    'Use only facts from their email; never invent requirements, terms or client names. Do not ask for details that are already known. Keep it under 260 words. The subject must be exactly "RE: " followed by their original subject line without any existing Re or Fw prefixes.',
   ].join(' ');
   const context = {
     recruiter: { name: lead.name, title: lead.title, company: lead.company, email: lead.email },
@@ -104,7 +117,7 @@ async function draftOfferReply(lead, options = {}) {
     messages: [{ role: 'user', content: `Write the reply.\n\n<context>\n${JSON.stringify(context, null, 2)}\n</context>` }],
   });
   if (response.stop_reason === 'refusal' || !response.parsed_output) return { ...templateOfferReply(lead, missing), missing, model: 'template' };
-  const subject = response.parsed_output.subject || `Re: ${lead.email_subject || 'Your email'}`;
+  const subject = replySubject(lead, response.parsed_output.subject);
   return { subject, body: response.parsed_output.body.trim(), missing, model: response.model || MODEL };
 }
 
@@ -137,7 +150,7 @@ async function analyzeInboundReply(lead, msg, options = {}) {
 function closeOutEmail(lead) {
   const first = leadFirstName(lead);
   return {
-    subject: `Re: ${lead.email_subject || 'Your email'}`,
+    subject: replySubject(lead),
     body: `Hi ${first},\n\nThank you for your time and consideration. If we can ever help you find a resource for a role you are trying to fill, please do not hesitate to call on us. We would be glad to put our network to work for you.\n\nWishing you continued success.`,
   };
 }
@@ -146,8 +159,8 @@ function followUpRequestEmail(lead, missing) {
   const first = leadFirstName(lead);
   const list = missing.map((m) => `- ${m.label}`).join('\n');
   return {
-    subject: `Re: ${lead.email_subject || 'Your email'}`,
-    body: `Hi ${first},\n\nThank you for confirming. To get started identifying the right resource, we just need a few more details:\n${list}\n\nOnce we have these, we will begin our search right away and send over candidate profiles as soon as we have a strong match.`,
+    subject: replySubject(lead),
+    body: `Hi ${first},\n\nThank you for confirming. To target our search accurately, could you confirm ${missing.length === 1 ? 'one detail' : 'a few details'}:\n\n${missing.map((m, i) => `${i + 1}. ${ASK_LABEL[m.key] || m.label}`).join('\n')}\n\nOnce we have these, we'll begin sourcing right away and send over candidate profiles as soon as we have a strong match.\n\nThanks again, ${first}.`,
   };
 }
 
@@ -170,8 +183,10 @@ async function setLead(pool, id, fields) {
 async function sendLeadEmail(pool, lead, { kind, subject, body, status, extra = {} }, options = {}) {
   if (!lead.email) throw Object.assign(new Error('Lead has no email address'), { status: 400 });
   const fullBody = `${body.trim()}\n\n${SIGNATURE}`;
-  const result = await sendEmail({ to: lead.email, bcc: LEAD_BCC || undefined, subject, text: fullBody, html: textToHtml(fullBody) }, options.sendOptions);
-  await logEmail(pool, lead, { direction: 'outbound', kind, subject, body: fullBody, to_email: lead.email, from_email: FROM_EMAIL });
+  // The email always reads as a direct reply: "RE: <their subject>", threaded on their message id where the transport allows it.
+  const finalSubject = lead.email_subject ? replySubject(lead, subject) : (/^\s*re:/i.test(subject) ? subject : `RE: ${subject}`);
+  const result = await sendEmail({ to: lead.email, bcc: LEAD_BCC || undefined, subject: finalSubject, text: fullBody, html: textToHtml(fullBody), inReplyTo: lead.message_id || undefined, references: lead.message_id || undefined }, options.sendOptions);
+  await logEmail(pool, lead, { direction: 'outbound', kind, subject: finalSubject, body: fullBody, to_email: lead.email, from_email: FROM_EMAIL });
   const now = new Date();
   const fields = { workflow_status: status, ...extra };
   // Any outbound communication means the lead has been worked: "new" is only
@@ -309,5 +324,5 @@ async function processFollowUps(pool, options = {}) {
 module.exports = {
   CRITICAL_FIELDS, missingInfo, addBusinessDays, draftOfferReply, templateOfferReply, analyzeInboundReply,
   closeOutEmail, followUpRequestEmail, sendLeadEmail, handleInboundReply, processFollowUps, createOpportunityFromLead,
-  logEmail, setLead, isAIConfigured, FOLLOW_UP_BUSINESS_DAYS, _setClientForTests, findOrCreateAccount, SIGNATURE, LEAD_BCC,
+  logEmail, setLead, isAIConfigured, FOLLOW_UP_BUSINESS_DAYS, _setClientForTests, findOrCreateAccount, SIGNATURE, LEAD_BCC, replySubject,
 };

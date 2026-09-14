@@ -93,12 +93,14 @@ function getSmtpTransporter() {
   return smtpTransporter;
 }
 
-async function sendViaSmtp({ to, bcc, subject, html, text, attachmentBuffer, attachmentFilename }, transporter) {
+async function sendViaSmtp({ to, bcc, subject, html, text, attachmentBuffer, attachmentFilename, inReplyTo, references }, transporter) {
   const t = transporter || getSmtpTransporter();
   const info = await t.sendMail({
     from: `"${FROM_NAME}" <${FROM_EMAIL}>`,
     to: Array.isArray(to) ? to.join(', ') : to,
     bcc: bcc ? (Array.isArray(bcc) ? bcc.join(', ') : bcc) : undefined,
+    inReplyTo: inReplyTo || undefined,
+    references: references || undefined,
     subject,
     html,
     text: text || undefined,
