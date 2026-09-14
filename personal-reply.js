@@ -19,6 +19,7 @@ const SCHEMA = [
   'ALTER TABLE users ADD COLUMN IF NOT EXISTS resume_updated_at TIMESTAMP',
   'ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(50)',
   'ALTER TABLE users ADD COLUMN IF NOT EXISTS headline VARCHAR(255)',
+  'ALTER TABLE users ADD COLUMN IF NOT EXISTS can_personal_reply BOOLEAN DEFAULT FALSE',
   `CREATE TABLE IF NOT EXISTS tailored_resumes (id SERIAL PRIMARY KEY, lead_id TEXT, user_id TEXT, job_title VARCHAR(255), subject VARCHAR(500), body TEXT, resume_markdown TEXT, filename VARCHAR(255), model VARCHAR(80), status VARCHAR(20) DEFAULT 'draft', sent_at TIMESTAMP, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`,
 ];
 
@@ -110,7 +111,15 @@ function install(deps) {
   const { app, pool, authenticateToken, requireAdmin, sendEmail, textToHtml, leadWorkflow, events, extractText, resumeUpload, notifyOwners } = deps;
   const one = async (sql, p) => (await pool.query(sql, p)).rows[0] || null;
   const wrap = (fn) => async (req, res) => { try { await fn(req, res); } catch (err) { res.status(err.status || 500).json({ error: err.message, code: err.code }); } };
-  const loadUser = (id) => one('SELECT id, name, email, phone, headline, resume_text, resume_filename, resume_updated_at FROM users WHERE id::text=$1', [String(id)]);
+  const loadUser = (id) => one('SELECT id, name, email, phone, headline, resume_text, resume_filename, resume_updated_at, can_personal_reply FROM users WHERE id::text=$1', [String(id)]);
+  // Permission: "Personal replies" is switched on per user by an admin (Settings > Users & Roles). Off by default.
+  const requirePersonal = async (req, res, next) => {
+    try {
+      const u = await loadUser(req.user.id);
+      if (!u || u.can_personal_reply !== true) return res.status(403).json({ error: 'Personal replies are not enabled for your account. An admin can turn them on under Settings > Users & Roles.', code: 'PERSONAL_REPLY_DISABLED' });
+      next();
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  };
   const loadLead = (id) => one('SELECT * FROM leads WHERE id::text=$1', [String(id)]);
 
   // ---- My resume (any signed-in user keeps their own; only admins can use it on leads) ----
@@ -151,7 +160,7 @@ function install(deps) {
   });
 
   // ---- Reply as myself (admin only) ----
-  app.post('/api/leads/:id/personal-draft', authenticateToken, requireAdmin, wrap(async (req, res) => {
+  app.post('/api/leads/:id/personal-draft', authenticateToken, requirePersonal, wrap(async (req, res) => {
     const lead = await loadLead(req.params.id); if (!lead) return res.status(404).json({ error: 'Lead not found' });
     const user = await loadUser(req.user.id);
     const d = await draftPersonalReply(lead, user);
@@ -161,12 +170,12 @@ function install(deps) {
     await events.record({ type: 'lead.personal_drafted', entity_type: 'lead', entity_id: lead.id, actor: `user:${req.user.id}`, payload: { model: d.model, draft_id: row.id } });
     res.json({ draft_id: row.id, subject: d.subject, body: d.body, fit_points: d.fit_points, resume_markdown: d.resume_markdown, filename, model: d.model, signature: leadWorkflow.SIGNATURE });
   }));
-  app.get('/api/leads/:id/personal-draft', authenticateToken, requireAdmin, wrap(async (req, res) => {
+  app.get('/api/leads/:id/personal-draft', authenticateToken, requirePersonal, wrap(async (req, res) => {
     const row = await one('SELECT * FROM tailored_resumes WHERE lead_id=$1 AND user_id=$2 ORDER BY id DESC LIMIT 1', [String(req.params.id), String(req.user.id)]);
     if (!row) return res.status(404).json({ error: 'No personal draft yet' });
     res.json({ draft_id: row.id, subject: row.subject, body: row.body, resume_markdown: row.resume_markdown, filename: row.filename, model: row.model, status: row.status, sent_at: row.sent_at, signature: leadWorkflow.SIGNATURE });
   }));
-  app.post('/api/leads/:id/personal-resume.docx', authenticateToken, requireAdmin, wrap(async (req, res) => {
+  app.post('/api/leads/:id/personal-resume.docx', authenticateToken, requirePersonal, wrap(async (req, res) => {
     const lead = await loadLead(req.params.id); if (!lead) return res.status(404).json({ error: 'Lead not found' });
     const user = await loadUser(req.user.id);
     const md = (req.body && req.body.resume_markdown) || (await one('SELECT resume_markdown FROM tailored_resumes WHERE lead_id=$1 AND user_id=$2 ORDER BY id DESC LIMIT 1', [String(lead.id), String(req.user.id)]) || {}).resume_markdown;
@@ -176,13 +185,15 @@ function install(deps) {
     res.setHeader('Content-Disposition', `attachment; filename="${resumeFilename(user, lead)}"`);
     res.send(buf);
   }));
-  app.post('/api/leads/:id/personal-reply', authenticateToken, requireAdmin, wrap(async (req, res) => {
+  app.post('/api/leads/:id/personal-reply', authenticateToken, requirePersonal, wrap(async (req, res) => {
     const lead = await loadLead(req.params.id); if (!lead) return res.status(404).json({ error: 'Lead not found' });
     if (!lead.email) return res.status(400).json({ error: 'Lead has no email address' });
     const user = await loadUser(req.user.id);
     const b = req.body || {};
     if (!b.subject || !b.body) return res.status(400).json({ error: 'subject and body are required' });
     const attach = b.attach_resume !== false;
+    const prior = await one("SELECT COUNT(*) AS n FROM lead_emails WHERE lead_id=$1 AND direction='outbound' AND kind IN ('offer_reply','info_request','close_out')", [String(lead.id)]);
+    if (Number(prior.n) > 0 && !b.confirm_double) return res.status(409).json({ error: 'The staffing reply has already been sent to this recruiter. Sending a personal I-am-interested reply as well would contradict it. Pass confirm_double to send anyway.', code: 'ALREADY_REPLIED' });
     if (attach && !b.resume_markdown) return res.status(400).json({ error: 'resume_markdown is required when attaching the tailored resume' });
     const fullBody = `${String(b.body).trim()}\n\n${leadWorkflow.SIGNATURE}`;
     const filename = resumeFilename(user, lead);

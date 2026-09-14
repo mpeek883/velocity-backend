@@ -1276,7 +1276,7 @@ app.delete('/api/users/:id', authenticateToken, requireAdmin, async (req, res) =
 });
 app.get('/api/users/me', authenticateToken, async (req, res) => {
   try {
-    const q = await pool.query('SELECT id, email, name, role, is_active, takes_leads FROM users WHERE id::text=$1', [String(req.user.id)]);
+    const q = await pool.query('SELECT id, email, name, role, is_active, takes_leads, can_personal_reply FROM users WHERE id::text=$1', [String(req.user.id)]);
     if (!q.rows.length) return res.status(404).json({ error: 'User not found' });
     const admins = await pool.query("SELECT COUNT(*) AS n FROM users WHERE role='admin'");
     const u = q.rows[0]; if (!u.role && Number(admins.rows[0].n) === 0) u.role = 'admin';
@@ -1285,12 +1285,12 @@ app.get('/api/users/me', authenticateToken, async (req, res) => {
 });
 app.put('/api/users/:id', authenticateToken, async (req, res) => {
   try {
-    const allowed = ['name', 'role', 'is_active', 'takes_leads'];
+    const allowed = ['name', 'role', 'is_active', 'takes_leads', 'can_personal_reply'];
     const fields = Object.fromEntries(Object.entries(req.body || {}).filter(([k]) => allowed.includes(k)));
     if (!Object.keys(fields).length) return res.status(400).json({ error: 'No valid fields' });
     if (fields.role !== undefined && !ROLES.includes(fields.role)) return res.status(400).json({ error: `Role must be one of ${ROLES.join(', ')}` });
-    // Role and active-state changes are admin-only; anyone may toggle their own takes_leads / name.
-    if ((fields.role !== undefined || fields.is_active !== undefined) || String(req.params.id) !== String(req.user.id)) {
+    // Role, active-state and permission changes are admin-only; anyone may toggle their own takes_leads / name.
+    if ((fields.role !== undefined || fields.is_active !== undefined || fields.can_personal_reply !== undefined) || String(req.params.id) !== String(req.user.id)) {
       const me = await pool.query('SELECT role FROM users WHERE id::text=$1', [String(req.user.id)]);
       const admins = await pool.query("SELECT COUNT(*) AS n FROM users WHERE role='admin'");
       const isAdmin = me.rows.length && (me.rows[0].role === 'admin' || Number(admins.rows[0].n) === 0);
@@ -1298,7 +1298,7 @@ app.put('/api/users/:id', authenticateToken, async (req, res) => {
       if (fields.is_active === false && String(req.params.id) === String(req.user.id)) return res.status(400).json({ error: 'You cannot deactivate yourself' });
     }
     const cols = Object.keys(fields);
-    const q = await pool.query(`UPDATE users SET ${cols.map((c, i) => `${c}=$${i + 1}`).join(', ')} WHERE id::text=$${cols.length + 1} RETURNING id, email, name, role, is_active, takes_leads, last_assigned_at`, [...cols.map((c) => fields[c]), String(req.params.id)]);
+    const q = await pool.query(`UPDATE users SET ${cols.map((c, i) => `${c}=$${i + 1}`).join(', ')} WHERE id::text=$${cols.length + 1} RETURNING id, email, name, role, is_active, takes_leads, can_personal_reply, last_assigned_at`, [...cols.map((c) => fields[c]), String(req.params.id)]);
     if (!q.rows.length) return res.status(404).json({ error: 'User not found' });
     res.json(q.rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1526,8 +1526,10 @@ app.post('/api/leads/:id/reply', authenticateToken, async (req, res) => {
   try {
     const lead = await loadLead(req.params.id);
     if (!lead) return res.status(404).json({ error: 'Lead not found' });
-    const { subject, body } = req.body || {};
+    const { subject, body, confirm_double } = req.body || {};
     if (!subject || !body) return res.status(400).json({ error: 'subject and body are required' });
+    const prior = await pool.query("SELECT kind FROM lead_emails WHERE lead_id=$1 AND direction='outbound' AND kind IN ('offer_reply','personal_reply')", [String(lead.id)]);
+    if (prior.rows.length && !confirm_double) return res.status(409).json({ error: prior.rows.some((r) => r.kind === 'personal_reply') ? 'You already replied to this recruiter personally (I am interested). Sending the staffing reply too would contradict it.' : 'The staffing reply was already sent to this recruiter.', code: 'ALREADY_REPLIED', kinds: prior.rows.map((r) => r.kind) });
     const missing = leadWorkflow.missingInfo(lead);
     const result = await leadWorkflow.sendLeadEmail(pool, lead, {
       kind: 'offer_reply', subject, body,

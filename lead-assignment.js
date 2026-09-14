@@ -8,7 +8,7 @@
 const OPEN_WORKFLOW = ['new', 'reviewed', 'replied', 'awaiting_info', 'interested'];
 
 async function listTeam(pool) {
-  const q = await pool.query('SELECT id, email, name, role, is_active, takes_leads, last_assigned_at FROM users ORDER BY name, id');
+  const q = await pool.query('SELECT id, email, name, role, is_active, takes_leads, can_personal_reply, last_assigned_at FROM users ORDER BY name, id');
   const loads = await pool.query(
     `SELECT assigned_to, COUNT(*) AS open_leads FROM leads
       WHERE assigned_to IS NOT NULL AND COALESCE(workflow_status,'new') = ANY($1) AND COALESCE(status,'new') <> 'unqualified'
