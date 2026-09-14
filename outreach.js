@@ -60,13 +60,13 @@ function install(deps) {
       const existingSub = await one('SELECT id FROM submissions WHERE job_order_id::text=$1 AND candidate_id::text=$2', [String(job.id), String(cand.id)]);
       if (existingSub) continue;
       let d;
-      try { d = useAI && isAIConfigured() ? await aiDraft({ candidate: cand, job, match }) : templateDraft({ candidate: cand, job, match }); } catch (e) { d = { ...templateDraft({ candidate: cand, job, match }), model: `template (AI failed: ${e.message.slice(0, 80)})` }; }
+      try { d = useAI && isAIConfigured() ? await aiDraft({ candidate: cand, job, match }) : templateDraft({ candidate: cand, job, match }); } catch (e) { d = { ...templateDraft({ candidate: cand, job, match }), model: 'template (AI failed)' }; await events.record({ type: 'outreach.ai_failed', entity_type: 'job_order', entity_id: job.id, result: 'error', error: e.message, payload: { candidate_id: cand.id } }); }
       await pool.query("DELETE FROM candidate_outreach WHERE job_order_id=$1 AND candidate_id=$2 AND status='draft'", [String(job.id), String(cand.id)]);
-      const row = await one('INSERT INTO candidate_outreach (job_order_id, candidate_id, status, subject, body, rank, score, model, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *', [String(job.id), String(cand.id), 'draft', d.subject, d.body, match.rank, match.score, d.model, createdBy == null ? null : String(createdBy)]);
+      const row = await one('INSERT INTO candidate_outreach (job_order_id, candidate_id, status, subject, body, rank, score, model, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *', [String(job.id), String(cand.id), 'draft', String(d.subject).slice(0, 255), d.body, match.rank, match.score, String(d.model).slice(0, 80), createdBy == null ? null : String(createdBy)]);
       drafts.push({ ...row, candidate_name: cand.name, candidate_email: cand.email, candidate_title: cand.title });
     }
     await events.record({ type: 'outreach.drafted', entity_type: 'job_order', entity_id: job.id, actor: createdBy ? `user:${createdBy}` : 'system', payload: { drafts: drafts.length, ai: useAI && isAIConfigured() } });
-    return { job_order: { id: job.id, title: job.title }, drafts, excluded: m.excluded, ai_used: drafts.some((d) => d.model !== 'template') };
+    return { job_order: { id: job.id, title: job.title }, drafts, excluded: m.excluded, ai_used: drafts.some((d) => !/^template/.test(d.model)) };
   }
 
   function outreachEmail(row, cand, job) {
