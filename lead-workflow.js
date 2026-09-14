@@ -175,6 +175,8 @@ async function sendLeadEmail(pool, lead, { kind, subject, body, status, extra = 
   // Any outbound communication means the lead has been worked: "new" is only
   // for leads that just dropped in from a scan or have not been touched yet.
   if (!fields.status && ['new', '', null, undefined].includes(lead.status)) fields.status = 'contacted';
+  // A close-out ends the conversation: no reply -> closed, they said no -> unqualified.
+  if (kind === 'close_out' && !extra.status && ['new', 'contacted', '', null, undefined].includes(lead.status)) fields.status = status === 'closed_no_response' ? 'closed' : 'unqualified';
   if (kind === 'offer_reply') { fields.replied_at = now; fields.follow_up_due_at = addBusinessDays(now, FOLLOW_UP_BUSINESS_DAYS); }
   if (kind === 'info_request') { fields.follow_up_due_at = addBusinessDays(now, FOLLOW_UP_BUSINESS_DAYS); }
   if (kind === 'close_out') { fields.follow_up_due_at = null; }
