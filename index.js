@@ -1174,7 +1174,7 @@ const scopedList = (table) => async (req, res) => {
 };
 app.get('/api/leads', authenticateToken, async (req, res) => {
   try {
-    const result = req.scopeOwner ? await pool.query('SELECT * FROM leads WHERE assigned_to::text=$1 ORDER BY created_at DESC', [req.scopeOwner.user_id]) : await pool.query('SELECT * FROM leads ORDER BY created_at DESC');
+    const result = req.scopeOwner ? await pool.query('SELECT * FROM leads WHERE assigned_to::text=$1 ORDER BY COALESCE(email_received_at, created_at) DESC, created_at DESC', [req.scopeOwner.user_id]) : await pool.query('SELECT * FROM leads ORDER BY COALESCE(email_received_at, created_at) DESC, created_at DESC');
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
