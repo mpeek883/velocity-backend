@@ -275,7 +275,7 @@ async function scanMailboxes(deps) {
             summary.replies_handled = (summary.replies_handled || 0) + 1;
             await pool.query(
               'INSERT INTO email_scan_log (mailbox, message_id, subject, from_email, received_at, classification, reason, lead_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
-              [box.address, msg.message_id, msg.subject, msg.from_email, msg.received_at || null, 'lead_reply', outcome.action, open.rows[0].id]);
+              [box.address, msg.message_id, msg.subject, msg.from_email, msg.received_at || null, 'lead_reply', outcome.action, String(open.rows[0].id)]);
             continue;
           }
         }
@@ -325,7 +325,7 @@ async function scanMailboxes(deps) {
         }
         await pool.query(
           'INSERT INTO email_scan_log (mailbox, message_id, subject, from_email, received_at, classification, reason, lead_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
-          [box.address, msg.message_id, msg.subject, msg.from_email, msg.received_at || null, classification, reason, leadId]);
+          [box.address, msg.message_id, msg.subject, msg.from_email, msg.received_at || null, classification, reason, leadId == null ? null : String(leadId)]);
       } catch (err) {
         r.errors.push(`${msg.subject || msg.message_id}: ${err.message}`);
       }

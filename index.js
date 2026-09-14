@@ -31,6 +31,47 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
 
+// Columns the app relies on for tables that may already exist in an older
+// shape (the previous server created leads/opportunities/contacts/accounts
+// with different columns). Applied as ADD COLUMN IF NOT EXISTS after the
+// CREATE TABLE IF NOT EXISTS, so both fresh and legacy databases end up
+// with every column the routes use.
+const REQUIRED_COLUMNS = {
+  leads: {
+    name: 'VARCHAR(255)', title: 'VARCHAR(255)', company: 'VARCHAR(255)', company_address: 'TEXT', company_website: 'VARCHAR(255)',
+    email: 'VARCHAR(255)', phone: 'VARCHAR(50)', linkedin: 'VARCHAR(255)', source: 'VARCHAR(100)', status: "VARCHAR(50) DEFAULT 'new'",
+    territory: 'VARCHAR(100)', score: 'INTEGER', job_title: 'VARCHAR(255)', job_location: 'VARCHAR(255)', job_description: 'TEXT',
+    rate_or_salary: 'VARCHAR(100)', notes: 'TEXT', mailbox: 'VARCHAR(255)', message_id: 'VARCHAR(512)', email_subject: 'VARCHAR(500)',
+    email_received_at: 'TIMESTAMP', workflow_status: "VARCHAR(50) DEFAULT 'new'", end_client: 'VARCHAR(255)', employment_type: 'VARCHAR(50)',
+    work_arrangement: 'VARCHAR(50)', missing_info: 'TEXT', reviewed_at: 'TIMESTAMP', replied_at: 'TIMESTAMP', last_inbound_at: 'TIMESTAMP',
+    follow_up_due_at: 'TIMESTAMP', opportunity_id: 'TEXT', account_id: 'TEXT', origin: "VARCHAR(20) DEFAULT 'manual'",
+    created_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP', updated_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+  },
+  opportunities: {
+    name: 'VARCHAR(255)', account: 'VARCHAR(255)', account_id: 'TEXT', contact: 'VARCHAR(255)', contact_email: 'VARCHAR(255)', value: 'NUMERIC(12,2)',
+    stage: "VARCHAR(50) DEFAULT 'Prospecting'", probability: 'INTEGER DEFAULT 20', close_date: 'DATE', type: "VARCHAR(50) DEFAULT 'New Business'",
+    competitor: 'VARCHAR(255)', notes: 'TEXT', forecast_category: 'VARCHAR(50)', win_loss_reason: 'TEXT', job_title: 'VARCHAR(255)', job_description: 'TEXT',
+    client_name: 'VARCHAR(255)', rate: 'VARCHAR(100)', work_location: 'VARCHAR(255)', work_arrangement: 'VARCHAR(50)', lead_id: 'TEXT',
+    created_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP', updated_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+  },
+  accounts: { name: 'VARCHAR(255)', industry: 'VARCHAR(100)', size: 'VARCHAR(50)', website: 'VARCHAR(255)', billing_contact: 'VARCHAR(255)', created_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP', updated_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' },
+  contacts: { name: 'VARCHAR(255)', email: 'VARCHAR(255)', phone: 'VARCHAR(50)', company: 'VARCHAR(255)', title: 'VARCHAR(255)', created_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP', updated_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' },
+};
+
+async function logSchemaSummary() {
+  try {
+    const q = await pool.query(
+      `SELECT table_name, column_name, data_type FROM information_schema.columns
+        WHERE table_schema='public' AND table_name = ANY($1) ORDER BY table_name, ordinal_position`,
+      [['leads', 'opportunities', 'accounts', 'contacts', 'candidates', 'lead_emails', 'candidate_profiles']]);
+    const byTable = {};
+    for (const r of q.rows) (byTable[r.table_name] = byTable[r.table_name] || []).push(`${r.column_name}:${r.data_type.replace('character varying', 'varchar').replace('timestamp without time zone', 'timestamp')}`);
+    for (const [t, cols] of Object.entries(byTable)) console.log(`🗂️ ${t}: ${cols.join(', ')}`);
+  } catch (err) {
+    console.error('⚠️ Schema summary failed:', err.message);
+  }
+}
+
 // Additive schema updates so existing databases pick up columns the frontend
 // panels use. Each statement is idempotent (ADD COLUMN IF NOT EXISTS).
 async function ensureSchema() {
@@ -86,24 +127,16 @@ async function ensureSchema() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`,
-    // Reply workflow fields on leads
-    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS workflow_status VARCHAR(50) DEFAULT 'new'",
-    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS end_client VARCHAR(255)",
-    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS employment_type VARCHAR(50)",
-    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS work_arrangement VARCHAR(50)",
-    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS missing_info TEXT",
-    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP",
-    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS replied_at TIMESTAMP",
-    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS last_inbound_at TIMESTAMP",
-    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS follow_up_due_at TIMESTAMP",
-    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS opportunity_id INTEGER",
-    // Where the lead came from: 'system' (inbox scan) or 'manual' (entered in the app)
-    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS origin VARCHAR(20) DEFAULT 'manual'",
+    // Legacy-safe: make sure every column the routes use exists on leads,
+    // opportunities, accounts, contacts (no-ops on fresh databases).
+    ...Object.entries(REQUIRED_COLUMNS).flatMap(([table, cols]) =>
+      Object.entries(cols).map(([col, type]) => `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${col} ${type}`)),
     "UPDATE leads SET origin='system' WHERE origin IS NULL AND message_id IS NOT NULL",
     "UPDATE leads SET origin='manual' WHERE origin IS NULL",
+    // lead_id is TEXT so it works whether leads.id is SERIAL (fresh) or UUID (legacy).
     `CREATE TABLE IF NOT EXISTS lead_emails (
       id SERIAL PRIMARY KEY,
-      lead_id INTEGER REFERENCES leads(id) ON DELETE CASCADE,
+      lead_id TEXT,
       direction VARCHAR(10),
       kind VARCHAR(30),
       subject VARCHAR(500),
@@ -135,7 +168,8 @@ async function ensureSchema() {
       rate VARCHAR(100),
       work_location VARCHAR(255),
       work_arrangement VARCHAR(50),
-      lead_id INTEGER,
+      lead_id TEXT,
+      account_id TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`,
@@ -148,7 +182,7 @@ async function ensureSchema() {
       received_at TIMESTAMP,
       classification VARCHAR(50),
       reason TEXT,
-      lead_id INTEGER,
+      lead_id TEXT,
       scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`,
     // Client-facing candidate profiles generated per submission
@@ -165,15 +199,19 @@ async function ensureSchema() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`,
   ];
+  let failures = 0;
   for (const sql of statements) {
     try {
       await pool.query(sql);
     } catch (err) {
-      console.error('⚠️ Schema update failed:', sql, '-', err.message);
+      failures += 1;
+      console.error('⚠️ Schema update failed:', sql.replace(/\s+/g, ' ').slice(0, 160), '-', err.message);
     }
   }
-  console.log('✅ Schema check complete');
+  console.log(failures ? `⚠️ Schema check complete with ${failures} failure(s)` : '✅ Schema check complete');
+  await logSchemaSummary();
 }
+
 
 pool.query('SELECT NOW()', (err, result) => {
   if (err) {
@@ -806,6 +844,20 @@ function startApolloSyncScheduler() {
   if (timer.unref) timer.unref();
   console.log(`🔄 Apollo job sync scheduled every ${APOLLO_SYNC_INTERVAL_MIN} min`);
 }
+
+// Authenticated schema report (tables + columns) for diagnostics.
+app.get('/api/admin/schema', authenticateToken, async (req, res) => {
+  try {
+    const q = await pool.query(
+      `SELECT table_name, column_name, data_type, is_nullable, column_default FROM information_schema.columns
+        WHERE table_schema='public' ORDER BY table_name, ordinal_position`);
+    const tables = {};
+    for (const r of q.rows) (tables[r.table_name] = tables[r.table_name] || []).push({ column: r.column_name, type: r.data_type, nullable: r.is_nullable === 'YES', default: r.column_default });
+    res.json({ tables });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ====== LEADS + RECRUITER EMAIL SCANNING ======
 app.get('/api/leads', authenticateToken, async (req, res) => {

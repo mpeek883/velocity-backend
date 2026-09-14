@@ -153,14 +153,14 @@ async function logEmail(pool, lead, { direction, kind, subject, body, message_id
   const ins = await pool.query(
     `INSERT INTO lead_emails (lead_id, direction, kind, subject, body, message_id, from_email, to_email, analysis)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-    [lead.id, direction, kind, subject, body, message_id, from_email, to_email, analysis ? JSON.stringify(analysis) : null]);
+    [String(lead.id), direction, kind, subject, body, message_id, from_email, to_email, analysis ? JSON.stringify(analysis) : null]);
   return ins.rows[0];
 }
 
 async function setLead(pool, id, fields) {
   const cols = Object.keys(fields);
   if (!cols.length) return null;
-  const q = await pool.query(`UPDATE leads SET ${cols.map((c, i) => `${c}=$${i + 1}`).join(', ')}, updated_at=CURRENT_TIMESTAMP WHERE id=$${cols.length + 1} RETURNING *`, [...cols.map((c) => fields[c]), id]);
+  const q = await pool.query(`UPDATE leads SET ${cols.map((c, i) => `${c}=$${i + 1}`).join(', ')}, updated_at=CURRENT_TIMESTAMP WHERE id=$${cols.length + 1} RETURNING *`, [...cols.map((c) => fields[c]), String(id)]);
   return q.rows[0];
 }
 
@@ -179,9 +179,24 @@ async function sendLeadEmail(pool, lead, { kind, subject, body, status, extra = 
   return { ...result, lead: updated };
 }
 
+/** Find the account for a client name, creating it if needed. Returns the row or null. */
+async function findOrCreateAccount(pool, name, extra = {}) {
+  const clean = String(name || '').trim();
+  if (!clean) return null;
+  const found = await pool.query('SELECT * FROM accounts WHERE LOWER(name)=LOWER($1) ORDER BY id LIMIT 1', [clean]);
+  if (found.rows.length) return found.rows[0];
+  const ins = await pool.query('INSERT INTO accounts (name, website) VALUES ($1, $2) RETURNING *', [clean, extra.website || null]);
+  return ins.rows[0];
+}
+
 async function createOpportunityFromLead(pool, lead, analysis = {}) {
   const clientName = lead.end_client || lead.company;
   const title = lead.job_title || 'Staffing request';
+  // Tie the chain together: the client becomes (or already is) an Account,
+  // the Opportunity points at that Account and at the Lead, and the Lead
+  // points back at both.
+  const account = await findOrCreateAccount(pool, clientName, { website: lead.end_client ? null : lead.company_website });
+  if (account && !lead.account_id) await setLead(pool, lead.id, { account_id: String(account.id) });
   const rateNum = parseFloat(String(lead.rate_or_salary || '').replace(/[^0-9.]/g, '')) || null;
   const notes = [
     analysis.summary,
@@ -191,10 +206,10 @@ async function createOpportunityFromLead(pool, lead, analysis = {}) {
     'Created automatically from recruiter email workflow.',
   ].filter(Boolean).join('\n');
   const ins = await pool.query(
-    `INSERT INTO opportunities (name, account, contact, contact_email, value, stage, probability, type, notes, job_title, job_description, client_name, rate, work_location, work_arrangement, lead_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
-    [`${clientName} - ${title}`, clientName, lead.name, lead.email, rateNum, 'Qualification', 40, 'New Business', notes,
-      lead.job_title || null, lead.job_description || null, clientName, lead.rate_or_salary || null, lead.job_location || null, lead.work_arrangement || null, lead.id]);
+    `INSERT INTO opportunities (name, account, account_id, contact, contact_email, value, stage, probability, type, notes, job_title, job_description, client_name, rate, work_location, work_arrangement, lead_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
+    [`${clientName} - ${title}`, clientName, account ? String(account.id) : null, lead.name, lead.email, rateNum, 'Qualification', 40, 'New Business', notes,
+      lead.job_title || null, lead.job_description || null, clientName, lead.rate_or_salary || null, lead.job_location || null, lead.work_arrangement || null, String(lead.id)]);
   return ins.rows[0];
 }
 
@@ -230,7 +245,7 @@ async function handleInboundReply(pool, lead, msg, options = {}) {
       return { action: 'info_requested', lead: r.lead, missing, analysis };
     }
     const opp = await createOpportunityFromLead(pool, current, analysis);
-    current = await setLead(pool, current.id, { workflow_status: 'opportunity_created', opportunity_id: opp.id, follow_up_due_at: null, missing_info: '[]' });
+    current = await setLead(pool, current.id, { workflow_status: 'opportunity_created', opportunity_id: String(opp.id), follow_up_due_at: null, missing_info: '[]' });
     return { action: 'opportunity_created', lead: current, opportunity: opp, analysis };
   }
   // Unclear: keep waiting, but give them another window.
