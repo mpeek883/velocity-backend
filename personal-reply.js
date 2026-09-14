@@ -29,6 +29,8 @@ const DraftSchema = z.object({
   resume_markdown: z.string().describe('The tailored resume in Markdown: # Name, contact line, ## Summary, ## Core Skills, ## Experience (company, title, dates, bullets), ## Education / Certifications. Only facts present in the base resume, re-ordered and emphasised for this role.'),
 });
 
+// Postgres refuses NUL bytes; PDF/DOCX extraction sometimes yields them plus other control characters.
+const cleanText = (t) => String(t || '').replace(/\u0000/g, '').replace(/[\u0001-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '').replace(/\r\n?/g, '\n').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
 function baseResumeMissing() { const e = new Error('Add your base resume under Settings > My Profile first (paste it or upload a PDF/DOCX).'); e.status = 409; e.code = 'RESUME_REQUIRED'; throw e; }
 
 function templateDraft(lead, user) {
@@ -96,9 +98,9 @@ function install(deps) {
   app.put('/api/users/me/resume', authenticateToken, wrap(async (req, res) => {
     const b = req.body || {};
     const sets = {};
-    if (b.resume_text !== undefined) { sets.resume_text = String(b.resume_text).slice(0, 60000); sets.resume_filename = b.resume_filename || 'pasted text'; }
+    if (b.resume_text !== undefined) { sets.resume_text = cleanText(b.resume_text).slice(0, 60000); sets.resume_filename = b.resume_filename || 'pasted text'; }
     if (b.phone !== undefined) sets.phone = String(b.phone).slice(0, 50);
-    if (b.headline !== undefined) sets.headline = String(b.headline).slice(0, 255);
+    if (b.headline !== undefined) sets.headline = cleanText(b.headline).slice(0, 255);
     const cols = Object.keys(sets);
     if (!cols.length) return res.status(400).json({ error: 'Nothing to save' });
     if (sets.resume_text !== undefined) { cols.push('resume_updated_at'); sets.resume_updated_at = new Date(); }
@@ -111,8 +113,8 @@ function install(deps) {
       try {
         if (uploadErr) return res.status(400).json({ error: uploadErr.code === 'LIMIT_FILE_SIZE' ? 'File is too large (max 5 MB).' : uploadErr.message });
         if (!req.file) return res.status(400).json({ error: 'Attach a PDF, DOCX or TXT file as "resume"' });
-        const text = await extractText(req.file.buffer, req.file.originalname);
-        if (!text || text.trim().length < 80) return res.status(400).json({ error: 'Could not read enough text from that file. Paste the resume text instead.' });
+        const text = cleanText(await extractText(req.file.buffer, req.file.originalname));
+        if (!text || text.length < 80) return res.status(400).json({ error: 'Could not read enough text from that file. Paste the resume text instead.' });
         await pool.query('UPDATE users SET resume_text=$1, resume_filename=$2, resume_updated_at=CURRENT_TIMESTAMP WHERE id::text=$3', [text.slice(0, 60000), req.file.originalname, String(req.user.id)]);
         await events.record({ type: 'user.resume_updated', entity_type: 'user', entity_id: req.user.id, actor: `user:${req.user.id}`, payload: { filename: req.file.originalname, chars: text.length } });
         res.json({ ok: true, chars: text.length, resume_filename: req.file.originalname });
