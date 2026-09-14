@@ -74,6 +74,8 @@ const REQUIRED_COLUMNS = {
   },
   users: { name: 'VARCHAR(255)', role: 'VARCHAR(50)', is_active: 'BOOLEAN DEFAULT TRUE', takes_leads: 'BOOLEAN DEFAULT TRUE', last_assigned_at: 'TIMESTAMP' },
   job_orders: { opportunity_id: 'TEXT', account_id: 'TEXT', priority: 'VARCHAR(20)', target_fill_date: 'DATE', required_skills: 'TEXT' },
+  submissions: { created_by: 'TEXT' },
+  placements: { created_by: 'TEXT', initial_end_date: 'DATE' },
   activities: {
     type: 'VARCHAR(50)', title: 'VARCHAR(255)', contact: 'VARCHAR(255)', account: 'VARCHAR(255)', due_at: 'TIMESTAMP', status: "VARCHAR(50) DEFAULT 'pending'", duration: 'VARCHAR(50)', notes: 'TEXT',
     lead_id: 'TEXT', opportunity_id: 'TEXT', account_id: 'TEXT', contact_id: 'TEXT', candidate_id: 'TEXT', created_by: 'TEXT', completed_at: 'TIMESTAMP',
@@ -529,13 +531,13 @@ const CANDIDATE_COLS  = ['name', 'email', 'phone', 'title', 'company', 'location
                          'linkedin', 'experience_years', 'work_auth', 'availability', 'availability_date', 'desired_rate', 'desired_salary', 'resume_text', 'notes'];
 const JOB_ORDER_COLS  = ['title', 'company', 'location', 'description', 'salary_min', 'salary_max', 'salary_range', 'status', 'opportunity_id', 'account_id', 'priority', 'target_fill_date', 'required_skills',
                          'source', 'url', 'apollo_job_id', 'apollo_org_id', 'posted_at', 'last_seen_at', 'last_synced_at'];
-const SUBMISSION_COLS = ['candidate_id', 'job_order_id', 'status', 'notes'];
+const SUBMISSION_COLS = ['candidate_id', 'job_order_id', 'status', 'notes', 'created_by'];
 const LEAD_COLS       = ['name', 'title', 'company', 'company_address', 'company_website', 'email', 'phone', 'linkedin', 'source', 'status', 'territory', 'score',
                          'job_title', 'job_location', 'job_description', 'rate_or_salary', 'notes',
                          'end_client', 'employment_type', 'work_arrangement', 'workflow_status', 'email_subject', 'email_from', 'email_body', 'email_received_at'];
 const OPP_COLS        = ['name', 'account', 'contact', 'contact_email', 'value', 'stage', 'probability', 'close_date', 'type', 'competitor', 'notes', 'forecast_category', 'win_loss_reason',
                          'job_title', 'job_description', 'client_name', 'rate', 'work_location', 'work_arrangement', 'lead_id', 'account_id'];
-const PLACEMENT_COLS  = ['submission_id', 'candidate_id', 'job_order_id', 'start_date', 'end_date', 'fee_amount', 'placement_status'];
+const PLACEMENT_COLS  = ['submission_id', 'candidate_id', 'job_order_id', 'start_date', 'end_date', 'fee_amount', 'placement_status', 'created_by', 'initial_end_date'];
 const ACTIVITY_COLS   = ['type', 'title', 'contact', 'account', 'due_at', 'status', 'duration', 'notes', 'lead_id', 'opportunity_id', 'account_id', 'contact_id', 'candidate_id'];
 
 // ====== MIDDLEWARE ======
@@ -1889,7 +1891,7 @@ app.get('/api/submissions', authenticateToken, async (req, res) => {
 
 app.post('/api/submissions', authenticateToken, async (req, res) => {
   try {
-    res.status(201).json(await insertRow('submissions', SUBMISSION_COLS, req.body));
+    res.status(201).json(await insertRow('submissions', SUBMISSION_COLS, { ...(req.body || {}), created_by: String(req.user.id) }));
   } catch (err) {
     sendDbError(res, err);
   }
@@ -1938,6 +1940,8 @@ app.post('/api/placements', authenticateToken, async (req, res) => {
       if (!body.candidate_id) body.candidate_id = sub.candidate_id;
       if (!body.job_order_id) body.job_order_id = sub.job_order_id;
     }
+    body.created_by = String(req.user.id);
+    if (body.end_date && !body.initial_end_date) body.initial_end_date = body.end_date;
     const row = await insertRow('placements', PLACEMENT_COLS, body);
     if (sub) {
       await pool.query("UPDATE submissions SET status='hired', updated_at=CURRENT_TIMESTAMP WHERE id=$1", [sub.id]).catch(() => {});
@@ -2026,6 +2030,108 @@ app.get('/api/analytics', authenticateToken, async (req, res) => {
       conversion: { leads: leads.rows.length, opportunities: converted, rate: leads.rows.length ? Math.round((converted / leads.rows.length) * 100) : 0 },
       activitiesByType: Object.entries(byType).map(([type, count]) => ({ type, count })), monthly,
       generated_at: new Date().toISOString(),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+// ---- Metrics: the standard staffing / recruiting KPIs, each with its definition ----
+const days = (a, b) => (a && b ? (new Date(b) - new Date(a)) / 86400000 : null);
+const avg = (arr) => { const v = arr.filter((x) => x != null && !Number.isNaN(x)); return v.length ? Math.round((v.reduce((s, x) => s + x, 0) / v.length) * 10) / 10 : null; };
+const pct = (n, d) => (d ? Math.round((n / d) * 1000) / 10 : null);
+const INTERVIEW_STAGES = ['phone screen', 'screening', 'technical', 'interview', 'hiring manager', 'final round', 'offer', 'hired', 'placed'];
+const OFFER_STAGES = ['offer', 'hired', 'placed'];
+const ACCEPTED_STAGES = ['hired', 'placed'];
+app.get('/api/metrics', authenticateToken, async (req, res) => {
+  try {
+    const [opps, leads, acts, users, cands, jobs, subs, places] = await Promise.all([
+      pool.query('SELECT * FROM opportunities'), pool.query('SELECT * FROM leads'), pool.query('SELECT * FROM activities'), pool.query('SELECT id, name, email FROM users'),
+      pool.query('SELECT * FROM candidates'), pool.query('SELECT * FROM job_orders'), pool.query('SELECT * FROM submissions'), pool.query('SELECT * FROM placements'),
+    ]);
+    const now = new Date();
+    const uname = new Map(users.rows.map((u) => [String(u.id), u.name || u.email]));
+    const who = (id) => (id ? uname.get(String(id)) || `User ${id}` : 'Unassigned');
+    const stage = (st) => String(st || '').toLowerCase();
+    const won = opps.rows.filter((o) => stage(o.stage) === 'closed won'), lost = opps.rows.filter((o) => stage(o.stage) === 'closed lost');
+    const open = opps.rows.filter((o) => !['closed won', 'closed lost'].includes(stage(o.stage)));
+    const fees = places.rows.reduce((s, p) => s + num(p.fee_amount), 0);
+    const groupSum = (rows, keyFn, valFn) => { const m = {}; for (const r of rows) { const k = keyFn(r); m[k] = m[k] || { count: 0, value: 0 }; m[k].count += 1; m[k].value += valFn ? valFn(r) : 0; } return m; };
+    const revenueByRecruiter = groupSum(places.rows, (p) => who(p.created_by), (p) => num(p.fee_amount));
+
+    // Speed
+    const jobById = new Map(jobs.rows.map((j) => [String(j.id), j]));
+    const subById = new Map(subs.rows.map((x) => [String(x.id), x]));
+    const firstSubByJob = {}; for (const x of subs.rows) { const k = String(x.job_order_id); if (!firstSubByJob[k] || new Date(x.created_at) < new Date(firstSubByJob[k])) firstSubByJob[k] = x.created_at; }
+    const daysToFirstSubmission = avg(Object.entries(firstSubByJob).map(([jid, at]) => { const j = jobById.get(jid); return j ? days(j.created_at, at) : null; }));
+    const daysToFill = avg(places.rows.map((p) => { const j = jobById.get(String(p.job_order_id)); return j ? days(j.created_at, p.start_date || p.created_at) : null; }));
+    const daysToHire = avg(places.rows.map((p) => { const x = subById.get(String(p.submission_id)); return x ? days(x.created_at, p.created_at) : null; }));
+    const replied = leads.rows.filter((l) => l.replied_at && l.created_at);
+    const hoursToFirstResponse = avg(replied.map((l) => (new Date(l.replied_at) - new Date(l.created_at)) / 36e5));
+
+    // Volume and quality
+    const leadsPerSource = groupSum(leads.rows, (l) => l.source || 'Unknown');
+    const interviewed = subs.rows.filter((x) => INTERVIEW_STAGES.includes(stage(x.status)));
+    const offered = subs.rows.filter((x) => OFFER_STAGES.includes(stage(x.status)));
+    const accepted = subs.rows.filter((x) => ACCEPTED_STAGES.includes(stage(x.status)));
+    const jobsWithSubs = new Set(subs.rows.map((x) => String(x.job_order_id))).size;
+    const placementsByRecruiter = groupSum(places.rows, (p) => who(p.created_by));
+
+    // Sourcing
+    const candsPerSource = groupSum(cands.rows, (c) => c.source || 'Unknown');
+    const authorized = cands.rows.filter((c) => workAuth.screenUS({ workAuth: c.work_auth, location: c.location, text: `${c.resume_text || ''}\n${c.notes || ''}` }).status === 'authorized').length;
+
+    // Retention
+    const matured = places.rows.filter((p) => p.start_date && days(p.start_date, now) >= 90);
+    const fellOff = places.rows.filter((p) => p.start_date && p.end_date && days(p.start_date, p.end_date) < 90 && ['terminated', 'fell_off', 'fell off', 'ended', 'cancelled'].includes(stage(p.placement_status)));
+    const withEnd = places.rows.filter((p) => p.initial_end_date || p.end_date);
+    const extended = withEnd.filter((p) => stage(p.placement_status) === 'extended' || (p.initial_end_date && p.end_date && new Date(p.end_date) > new Date(p.initial_end_date)));
+
+    // Activity (last 4 weeks, per recruiter per week)
+    const since = new Date(now.getTime() - 28 * 86400000);
+    const recent = acts.rows.filter((a) => a.created_at && new Date(a.created_at) >= since);
+    const perRec = {};
+    for (const a of recent) { const k = who(a.created_by); perRec[k] = perRec[k] || { recruiter: k, calls: 0, emails: 0, meetings: 0, tasks: 0 }; const t = stage(a.type); if (t === 'call') perRec[k].calls += 1; else if (t === 'email') perRec[k].emails += 1; else if (t === 'meeting') perRec[k].meetings += 1; else perRec[k].tasks += 1; }
+    const perWeek = Object.values(perRec).map((r) => ({ recruiter: r.recruiter, calls_per_week: Math.round(r.calls / 4 * 10) / 10, emails_per_week: Math.round(r.emails / 4 * 10) / 10, meetings_per_week: Math.round(r.meetings / 4 * 10) / 10, tasks_per_week: Math.round(r.tasks / 4 * 10) / 10 }));
+    const overdueActivities = acts.rows.filter((a) => a.status !== 'completed' && a.due_at && new Date(a.due_at) < now);
+    const overdueLeads = leads.rows.filter((l) => ['replied', 'awaiting_info'].includes(l.workflow_status) && l.follow_up_due_at && new Date(l.follow_up_due_at) < now);
+
+    const m = (value, definition, extra) => ({ value, definition, ...(extra || {}) });
+    res.json({
+      generated_at: now.toISOString(),
+      pipeline: {
+        open_pipeline_value: m(open.reduce((s, o) => s + num(o.value), 0), 'Sum of value on opportunities not yet closed.', { count: open.length }),
+        closed_won_value: m(won.reduce((s, o) => s + num(o.value), 0), 'Sum of value on opportunities marked Closed Won.', { count: won.length }),
+        win_rate: m(pct(won.length, won.length + lost.length), 'Closed Won divided by all closed deals (won + lost), as a percentage.'),
+        avg_deal_size: m(won.length ? Math.round(won.reduce((s, o) => s + num(o.value), 0) / won.length) : null, 'Closed-won value divided by the number of won deals.'),
+        fees_per_placement: m(places.rows.length ? Math.round(fees / places.rows.length) : null, 'Total placement fees divided by the number of placements.', { total_fees: fees, placements: places.rows.length }),
+        revenue_per_recruiter: m(Object.entries(revenueByRecruiter).map(([recruiter, v]) => ({ recruiter, fees: v.value, placements: v.count })).sort((a, b) => b.fees - a.fees), 'Placement fees grouped by the user who recorded the placement.'),
+      },
+      speed: {
+        hours_to_first_response: m(hoursToFirstResponse, 'Average hours from a lead being created to the first reply sent.', { leads: replied.length }),
+        days_to_first_submission: m(daysToFirstSubmission, 'Average days from a job order being created to its first submission.', { job_orders: Object.keys(firstSubByJob).length }),
+        days_to_fill: m(daysToFill, 'Average days from a job order being created to the placement start date.', { placements: places.rows.length }),
+        days_to_hire: m(daysToHire, 'Average days from a candidate being submitted to the placement being recorded.', { placements: places.rows.length }),
+      },
+      volume: {
+        leads_per_source: m(Object.entries(leadsPerSource).map(([source, v]) => ({ source, count: v.count })).sort((a, b) => b.count - a.count), 'Leads grouped by source.'),
+        lead_to_opportunity_rate: m(pct(leads.rows.filter((l) => l.opportunity_id).length, leads.rows.length), 'Leads that became an opportunity, as a percentage of all leads.', { leads: leads.rows.length, opportunities: leads.rows.filter((l) => l.opportunity_id).length }),
+        submissions_per_job_order: m(jobsWithSubs ? Math.round(subs.rows.length / jobsWithSubs * 10) / 10 : null, 'Submissions divided by job orders that received at least one.', { submissions: subs.rows.length, job_orders: jobsWithSubs }),
+        submission_to_interview_rate: m(pct(interviewed.length, subs.rows.length), 'Submissions that reached an interview stage (phone screen or later), as a percentage of all submissions.', { interviewed: interviewed.length, submissions: subs.rows.length }),
+        interview_to_offer_rate: m(pct(offered.length, interviewed.length), 'Interviewed submissions that reached Offer or beyond, as a percentage.', { offered: offered.length, interviewed: interviewed.length }),
+        offer_acceptance_rate: m(pct(accepted.length, offered.length), 'Offers that became Hired, as a percentage of offers.', { accepted: accepted.length, offered: offered.length }),
+        placements_per_recruiter: m(Object.entries(placementsByRecruiter).map(([recruiter, v]) => ({ recruiter, placements: v.count })).sort((a, b) => b.placements - a.placements), 'Placements grouped by the user who recorded them.'),
+      },
+      sourcing: {
+        candidates_per_source: m(Object.entries(candsPerSource).map(([source, v]) => ({ source, count: v.count })).sort((a, b) => b.count - a.count), 'Candidates grouped by where they came from (resume upload, sourced board, referral...).'),
+        cost_per_hire: m(places.rows.length ? Math.round(num(process.env.SOURCING_SPEND_YTD) / places.rows.length) : 0, 'Sourcing spend divided by placements. Set SOURCING_SPEND_YTD on the API service if paid sources are used; the built-in boards are free.', { spend: num(process.env.SOURCING_SPEND_YTD) }),
+        pct_candidates_us_authorized: m(pct(authorized, cands.rows.length), 'Candidates with an explicit US work authorization on file, as a percentage of all candidates.', { authorized, candidates: cands.rows.length }),
+      },
+      retention: {
+        falloff_rate_90d: m(pct(fellOff.length, matured.length + fellOff.length), 'Placements that ended within 90 days of starting, as a percentage of placements old enough to judge.', { fell_off: fellOff.length, matured: matured.length }),
+        extension_rate: m(pct(extended.length, withEnd.length), 'Contract placements whose end date was pushed past the original end date (or marked extended), as a percentage of placements with an end date.', { extended: extended.length, with_end_date: withEnd.length }),
+      },
+      activity: {
+        per_recruiter_per_week: m(perWeek, 'Average weekly calls, emails, meetings and tasks per recruiter over the last four weeks.'),
+        overdue_followups: m(overdueActivities.length + overdueLeads.length, 'Pending activities past their due date plus leads whose follow-up window has passed.', { activities: overdueActivities.length, leads: overdueLeads.length }),
+      },
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
