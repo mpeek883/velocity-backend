@@ -1,0 +1,54 @@
+# Nightly encrypted backup of the production Postgres database.
+#
+# Setup (once, in this repository's Settings > Secrets and variables > Actions):
+#   DATABASE_URL        the External Database URL from the Render Postgres page
+#   BACKUP_PASSPHRASE   a long random passphrase; keep a copy in your password manager
+#
+# Each run stores a pg_dump, encrypted with the passphrase (AES-256 via gpg),
+# as a workflow artifact kept for 90 days. This repository is public, so the
+# dump is never stored unencrypted. Restore:
+#   gpg --batch --passphrase "$BACKUP_PASSPHRASE" -d velocitycrm-YYYY-MM-DD.dump.gpg > db.dump
+#   pg_restore --clean --no-owner --dbname "$DATABASE_URL" db.dump
+name: Database backup
+
+on:
+  schedule:
+    - cron: '30 7 * * *'   # daily 07:30 UTC
+  workflow_dispatch:
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check configuration
+        run: |
+          if [ -z "${{ secrets.DATABASE_URL }}" ] || [ -z "${{ secrets.BACKUP_PASSPHRASE }}" ]; then
+            echo "DATABASE_URL and BACKUP_PASSPHRASE secrets are not set; skipping backup."
+            echo "skip=1" >> $GITHUB_ENV
+          fi
+      - name: Install PostgreSQL client (matching Render's Postgres 16)
+        if: env.skip != '1'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-16 || sudo apt-get install -y -qq postgresql-client
+      - name: Dump and encrypt
+        if: env.skip != '1'
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          STAMP=$(date -u +%Y-%m-%d)
+          pg_dump --format=custom --no-owner --no-privileges "$DATABASE_URL" > "velocitycrm-$STAMP.dump"
+          gpg --batch --yes --symmetric --cipher-algo AES256 --passphrase "$BACKUP_PASSPHRASE" -o "velocitycrm-$STAMP.dump.gpg" "velocitycrm-$STAMP.dump"
+          rm "velocitycrm-$STAMP.dump"
+          ls -la velocitycrm-*.gpg
+          echo "stamp=$STAMP" >> $GITHUB_ENV
+      - name: Keep the encrypted dump for 90 days
+        if: env.skip != '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: velocitycrm-db-${{ env.stamp }}
+          path: velocitycrm-*.dump.gpg
+          retention-days: 90
+          if-no-files-found: error
