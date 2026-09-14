@@ -94,12 +94,55 @@ async function logSchemaSummary() {
     const q = await pool.query(
       `SELECT table_name, column_name, data_type FROM information_schema.columns
         WHERE table_schema='public' AND table_name = ANY($1) ORDER BY table_name, ordinal_position`,
-      [['leads', 'opportunities', 'accounts', 'contacts', 'candidates', 'lead_emails', 'candidate_profiles']]);
+      [['leads', 'opportunities', 'accounts', 'contacts', 'candidates', 'lead_emails', 'candidate_profiles', 'users', 'candidate_matches']]);
     const byTable = {};
     for (const r of q.rows) (byTable[r.table_name] = byTable[r.table_name] || []).push(`${r.column_name}:${r.data_type.replace('character varying', 'varchar').replace('timestamp without time zone', 'timestamp')}`);
     for (const [t, cols] of Object.entries(byTable)) console.log(`🗂️ ${t}: ${cols.join(', ')}`);
   } catch (err) {
     console.error('⚠️ Schema summary failed:', err.message);
+  }
+}
+
+// Link columns must accept ids from either side whether the referenced table
+// uses SERIAL integers (fresh databases) or UUIDs (the legacy Production
+// tables). Any link column that is not already text is converted in place
+// (values kept via ::text), dropping a same-named foreign key if one exists.
+const LINK_COLUMNS = [
+  ['leads', 'opportunity_id'], ['leads', 'account_id'], ['leads', 'assigned_to'],
+  ['opportunities', 'lead_id'], ['opportunities', 'account_id'],
+  ['contacts', 'candidate_id'], ['contacts', 'lead_id'], ['contacts', 'account_id'],
+  ['lead_emails', 'lead_id'], ['email_scan_log', 'lead_id'],
+  ['candidate_matches', 'target_id'], ['candidate_matches', 'candidate_id'],
+];
+async function reconcileLinkColumns() {
+  const tables = [...new Set(LINK_COLUMNS.map(([t]) => t))];
+  let q;
+  try {
+    q = await pool.query(
+      `SELECT table_name, column_name, data_type FROM information_schema.columns
+        WHERE table_schema='public' AND table_name IN (${tables.map((_, i) => `$${i + 1}`).join(', ')})`, tables);
+  } catch (err) {
+    console.error('⚠️ Link column check skipped:', err.message);
+    return;
+  }
+  const types = new Map(q.rows.map((r) => [`${r.table_name}.${r.column_name}`, r.data_type]));
+  for (const [table, col] of LINK_COLUMNS) {
+    const t = types.get(`${table}.${col}`);
+    if (!t || t === 'text' || t === 'character varying') continue;
+    try {
+      // Drop any foreign key on this column first (its name may vary).
+      try {
+        const fks = await pool.query(
+          `SELECT con.conname FROM pg_constraint con
+             JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = ANY(con.conkey)
+            WHERE con.contype = 'f' AND con.conrelid = $1::regclass AND a.attname = $2`, [table, col]);
+        for (const fk of fks.rows) await pool.query(`ALTER TABLE ${table} DROP CONSTRAINT IF EXISTS ${fk.conname}`);
+      } catch { /* no catalog access (test db): fall through to the type change */ }
+      await pool.query(`ALTER TABLE ${table} ALTER COLUMN ${col} TYPE TEXT USING ${col}::text`);
+      console.log(`🔗 ${table}.${col}: ${t} -> text`);
+    } catch (err) {
+      console.error(`⚠️ Could not convert ${table}.${col} (${t}) to text:`, err.message.split(String.fromCharCode(10))[0]);
+    }
   }
 }
 
@@ -286,6 +329,7 @@ async function ensureSchema() {
     }
   }
   console.log(failures ? `⚠️ Schema check complete with ${failures} failure(s)` : '✅ Schema check complete');
+  await reconcileLinkColumns();
   await backfillRecordNumbers();
   try {
     const b = await contactsSync.backfillContacts(pool);
