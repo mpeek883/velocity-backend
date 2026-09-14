@@ -218,7 +218,10 @@ function leadFromExtraction(msg, box, ex) {
     j.rate_or_salary ? `Rate/Salary: ${j.rate_or_salary}` : '',
     `Source email: "${msg.subject}" from ${msg.from_email} on ${msg.received_at || 'unknown date'} (${box.address})`,
   ].filter(Boolean);
-  return {
+  // Keep every field inside its column width; the model sometimes returns a
+  // sentence where a short value was expected.
+  const clamp = (v, n) => (v == null ? v : String(v).slice(0, n));
+  const out = {
     name: r.name || msg.from_name || msg.from_email,
     title: r.title || '',
     company: r.company || (msg.from_email.split('@')[1] || ''),
@@ -248,6 +251,9 @@ function leadFromExtraction(msg, box, ex) {
     email_from: msg.from_name ? `${msg.from_name} <${msg.from_email}>` : msg.from_email,
     email_body: String(msg.text || '').slice(0, 20000),
   };
+  const limits = { name: 250, title: 250, company: 250, company_website: 250, email: 250, phone: 50, linkedin: 250, job_title: 250, job_location: 250, rate_or_salary: 100, end_client: 250, employment_type: 50, work_arrangement: 50, mailbox: 250, message_id: 500, email_subject: 490, email_from: 250 };
+  for (const [k, n] of Object.entries(limits)) if (typeof out[k] === 'string') out[k] = clamp(out[k], n);
+  return out;
 }
 
 /** Keep the original outreach in the lead's conversation log. */

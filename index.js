@@ -151,6 +151,20 @@ async function reconcileLinkColumns() {
   }
 }
 
+// Columns that turned out too narrow for real data (model output, long
+// phone strings). Widened in place; harmless where already wide enough.
+const WIDEN_COLUMNS = [
+  ['leads', 'employment_type', 'VARCHAR(255)'], ['leads', 'work_arrangement', 'VARCHAR(255)'], ['leads', 'rate_or_salary', 'VARCHAR(255)'], ['leads', 'phone', 'VARCHAR(100)'],
+  ['opportunities', 'work_arrangement', 'VARCHAR(255)'], ['opportunities', 'rate', 'VARCHAR(255)'],
+  ['candidates', 'phone', 'VARCHAR(100)'], ['contacts', 'phone', 'VARCHAR(100)'],
+];
+async function widenColumns() {
+  for (const [table, col, type] of WIDEN_COLUMNS) {
+    try { await pool.query(`ALTER TABLE ${table} ALTER COLUMN ${col} TYPE ${type}`); }
+    catch (err) { if (!/failed to parse|not supported/i.test(err.message)) console.error(`⚠️ Could not widen ${table}.${col}:`, err.message.split(String.fromCharCode(10))[0]); }
+  }
+}
+
 // Additive schema updates so existing databases pick up columns the frontend
 // panels use. Each statement is idempotent (ADD COLUMN IF NOT EXISTS).
 async function ensureSchema() {
@@ -353,6 +367,7 @@ async function ensureSchema() {
   }
   console.log(failures ? `⚠️ Schema check complete with ${failures} failure(s)` : '✅ Schema check complete');
   await reconcileLinkColumns();
+  await widenColumns();
   await backfillRecordNumbers();
   try {
     const b = await contactsSync.backfillContacts(pool);
