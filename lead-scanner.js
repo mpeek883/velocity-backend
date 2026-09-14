@@ -191,6 +191,23 @@ async function classifyMessage(msg, options = {}) {
 // ---------------------------------------------------------------------------
 // Lead assembly
 // ---------------------------------------------------------------------------
+/** Normalize a role name / subject for comparison: lowercase, no Re:/Fwd:, no req ids or punctuation. */
+function roleKey(v) {
+  return String(v || '').toLowerCase()
+    .replace(/^(\s*(re|fw|fwd|aw|tr)\s*:\s*)+/g, '')
+    .replace(/\b[a-z]*\d{4,}[a-z0-9-]*\b/g, ' ')   // requisition / job ids
+    .replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+/** Same recruiter request? Titles equal (or one contains the other) or the email subject matches. */
+function sameRole(a, b) {
+  const ta = roleKey(a.job_title), tb = roleKey(b.job_title);
+  if (ta && tb && (ta === tb || ta.includes(tb) || tb.includes(ta))) return true;
+  const sa = roleKey(a.email_subject), sb = roleKey(b.email_subject);
+  if (sa && sb && sa === sb) return true;
+  if (!ta && !tb && !sa && !sb) return true; // nothing to tell them apart
+  return false;
+}
+
 function leadFromExtraction(msg, box, ex) {
   const r = ex.recruiter || {};
   const j = ex.job || {};
@@ -284,14 +301,17 @@ async function scanMailboxes(deps) {
         // in the offer workflow, not a new lead.
         const fromEmail = String(msg.from_email || '').toLowerCase();
         if (fromEmail) {
-          const open = await pool.query("SELECT * FROM leads WHERE LOWER(email)=$1 AND workflow_status IN ('replied','awaiting_info') ORDER BY id LIMIT 1", [fromEmail]);
+          const open = await pool.query("SELECT * FROM leads WHERE LOWER(email)=$1 AND workflow_status IN ('replied','awaiting_info') ORDER BY replied_at DESC NULLS LAST, id", [fromEmail]);
           if (open.rows.length) {
-            const outcome = await (deps.handleInbound || module.exports.handleInboundReply)(pool, open.rows[0], msg);
+            // Several roles in play with this recruiter: route the reply to the
+            // lead whose subject / role matches, otherwise the most recent one.
+            const target = open.rows.find((l) => sameRole(l, { job_title: '', email_subject: msg.subject })) || open.rows.find((l) => sameRole(l, { job_title: msg.subject, email_subject: '' })) || open.rows[0];
+            const outcome = await (deps.handleInbound || module.exports.handleInboundReply)(pool, target, msg);
             r.replies_handled = (r.replies_handled || 0) + 1;
             summary.replies_handled = (summary.replies_handled || 0) + 1;
             await pool.query(
               'INSERT INTO email_scan_log (mailbox, message_id, subject, from_email, received_at, classification, reason, lead_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
-              [box.address, msg.message_id, msg.subject, msg.from_email, msg.received_at || null, 'lead_reply', outcome.action, String(open.rows[0].id)]);
+              [box.address, msg.message_id, msg.subject, msg.from_email, msg.received_at || null, 'lead_reply', outcome.action, String(target.id)]);
             continue;
           }
         }
@@ -309,18 +329,21 @@ async function scanMailboxes(deps) {
           if (ex.is_recruiter_outreach && (Number(ex.confidence) || 0) >= 0.5) {
             classification = 'recruiter_lead';
             const lead = leadFromExtraction(msg, box, ex);
-            const existing = lead.email ? await pool.query('SELECT * FROM leads WHERE LOWER(email)=$1 ORDER BY id LIMIT 1', [lead.email]) : { rows: [] };
-            if (existing.rows.length) {
-              // Same recruiter again: keep known contact details unless the new
-              // email supplies them, replace the job fields with the latest role,
-              // and append to the notes.
-              const cur = existing.rows[0];
+            // One lead per recruiter AND role. The same recruiter writing about
+            // a different role gets a new lead so each request is worked on its
+            // own; a follow-up about the same role merges into that lead.
+            const siblings = lead.email ? (await pool.query('SELECT * FROM leads WHERE LOWER(email)=$1 ORDER BY id', [lead.email])).rows : [];
+            const cur = siblings.find((l) => sameRole(l, lead)) || null;
+            if (cur) {
               const keep = (fresh, old) => (fresh && String(fresh).trim() ? fresh : (old || null));
               const merged = {
                 name: keep(lead.name, cur.name), title: keep(lead.title, cur.title), company: keep(lead.company, cur.company),
                 company_address: keep(lead.company_address, cur.company_address), company_website: keep(lead.company_website, cur.company_website),
                 phone: keep(lead.phone, cur.phone), linkedin: keep(lead.linkedin, cur.linkedin),
-                job_title: lead.job_title, job_location: lead.job_location, job_description: lead.job_description, rate_or_salary: lead.rate_or_salary,
+                job_title: keep(lead.job_title, cur.job_title), job_location: keep(lead.job_location, cur.job_location),
+                job_description: (String(lead.job_description || '').length > String(cur.job_description || '').length ? lead.job_description : cur.job_description) || null,
+                rate_or_salary: keep(lead.rate_or_salary, cur.rate_or_salary), end_client: keep(lead.end_client, cur.end_client),
+                employment_type: keep(lead.employment_type, cur.employment_type), work_arrangement: keep(lead.work_arrangement, cur.work_arrangement),
                 notes: [cur.notes, '---', lead.notes].filter(Boolean).join('\n'),
                 score: Math.max(Number(cur.score) || 0, lead.score),
                 mailbox: lead.mailbox, message_id: lead.message_id, email_subject: lead.email_subject, email_received_at: lead.email_received_at,
@@ -334,6 +357,13 @@ async function scanMailboxes(deps) {
               await logOutreach(pool, leadId, lead);
               if (module.exports.onLeadUpdated) { try { await module.exports.onLeadUpdated({ ...cur, ...merged, id: cur.id }); } catch (e) { r.errors.push(`post-update hook: ${e.message}`); } }
             } else {
+              if (siblings.length) {
+                // Known recruiter, new role: carry over contact details the new email did not repeat.
+                const last = siblings[siblings.length - 1];
+                for (const k of ['name', 'title', 'company', 'company_address', 'company_website', 'phone', 'linkedin']) {
+                  if (!(lead[k] && String(lead[k]).trim()) && last[k]) lead[k] = last[k];
+                }
+              }
               const cols = Object.keys(lead);
               const ins = await pool.query(`INSERT INTO leads (${cols.join(', ')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING *`, cols.map((c) => lead[c]));
               leadId = ins.rows[0].id; r.leads_created += 1; summary.leads_created += 1;
@@ -357,7 +387,7 @@ async function scanMailboxes(deps) {
 }
 
 module.exports = {
-  listMailboxes, publicMailboxes, fetchGraphMessages, fetchImapMessages, prefilter, classifyMessage, leadFromExtraction, scanMailboxes, htmlToText, isLeadAIConfigured, MODEL, _setClientForTests,
+  listMailboxes, publicMailboxes, fetchGraphMessages, fetchImapMessages, prefilter, classifyMessage, leadFromExtraction, scanMailboxes, htmlToText, isLeadAIConfigured, MODEL, _setClientForTests, sameRole, roleKey,
   // Reply handling lives in lead-workflow.js; resolved lazily so tests can swap it.
   handleInboundReply: (pool, lead, msg) => require('./lead-workflow').handleInboundReply(pool, lead, msg),
 };

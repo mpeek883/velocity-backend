@@ -407,7 +407,13 @@ async function checkDuplicate(table, b) {
     if (!email && !name) return null;
     rows = (await pool.query(`SELECT * FROM ${table} WHERE LOWER(COALESCE(email,''))=$1 OR LOWER(COALESCE(name,''))=$2`, [email || '-', name || '-'])).rows;
     test = (r) => {
-      if (email && norm(r.email) === email) return 'same email';
+      // A lead is the same request only when the recruiter AND the role match;
+      // the same recruiter with a different role is a separate lead.
+      if (email && norm(r.email) === email) {
+        if (table !== 'leads') return 'same email';
+        if (leadScanner.sameRole(r, { job_title: b.job_title, email_subject: b.email_subject })) return 'same email and role';
+        return null;
+      }
       if (name && norm(r.name) === name) {
         if (company && norm(r.company) === company) return 'same name and company';
         if (digits && String(r.phone || '').replace(/\D/g, '') === digits) return 'same name and phone';
@@ -1305,6 +1311,16 @@ app.post('/api/integrations/:id/test', authenticateToken, async (req, res) => {
   } catch (err) { res.status(502).json({ error: err.message }); }
 });
 
+// Forget scanned messages from one sender so the next scan re-reads them
+// (used after deleting a lead that should be split per role).
+app.post('/api/leads/scan/forget', authenticateToken, async (req, res) => {
+  try {
+    const email = String((req.body && req.body.email) || '').toLowerCase().trim();
+    if (!email) return res.status(400).json({ error: 'email is required' });
+    const q = await pool.query('DELETE FROM email_scan_log WHERE LOWER(from_email)=$1 RETURNING id', [email]);
+    res.json({ forgotten: q.rows.length, email });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 app.post('/api/leads/scan', authenticateToken, async (req, res) => {
   try {
     if (!leadScanner.isLeadAIConfigured()) return res.status(503).json({ error: 'AI not configured (ANTHROPIC_API_KEY missing)', code: 'AI_NOT_CONFIGURED' });
