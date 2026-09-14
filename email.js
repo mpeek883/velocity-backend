@@ -49,7 +49,7 @@ async function getGraphToken(fetchImpl) {
   return graphToken.value;
 }
 
-async function sendViaGraph({ to, subject, html, attachmentBuffer, attachmentFilename }, fetchImpl) {
+async function sendViaGraph({ to, bcc, subject, html, attachmentBuffer, attachmentFilename }, fetchImpl) {
   const token = await getGraphToken(fetchImpl);
   const message = {
     subject,
@@ -57,6 +57,7 @@ async function sendViaGraph({ to, subject, html, attachmentBuffer, attachmentFil
     toRecipients: (Array.isArray(to) ? to : [to]).map((address) => ({ emailAddress: { address } })),
     from: { emailAddress: { address: FROM_EMAIL, name: FROM_NAME } },
   };
+  if (bcc) message.bccRecipients = (Array.isArray(bcc) ? bcc : [bcc]).filter(Boolean).map((address) => ({ emailAddress: { address } }));
   if (attachmentBuffer && attachmentFilename) {
     message.attachments = [{
       '@odata.type': '#microsoft.graph.fileAttachment',
@@ -92,11 +93,12 @@ function getSmtpTransporter() {
   return smtpTransporter;
 }
 
-async function sendViaSmtp({ to, subject, html, text, attachmentBuffer, attachmentFilename }, transporter) {
+async function sendViaSmtp({ to, bcc, subject, html, text, attachmentBuffer, attachmentFilename }, transporter) {
   const t = transporter || getSmtpTransporter();
   const info = await t.sendMail({
     from: `"${FROM_NAME}" <${FROM_EMAIL}>`,
     to: Array.isArray(to) ? to.join(', ') : to,
+    bcc: bcc ? (Array.isArray(bcc) ? bcc.join(', ') : bcc) : undefined,
     subject,
     html,
     text: text || undefined,

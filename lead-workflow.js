@@ -17,6 +17,8 @@ const { sendEmail, textToHtml, FROM_EMAIL } = require('./email');
 const MODEL = process.env.LEAD_AI_MODEL || 'claude-opus-5';
 const FOLLOW_UP_BUSINESS_DAYS = parseInt(process.env.LEAD_FOLLOW_UP_BUSINESS_DAYS || '3', 10);
 
+// Every email that leaves the Leads area is blind-copied here (set LEAD_EMAIL_BCC to '' to stop).
+const LEAD_BCC = process.env.LEAD_EMAIL_BCC === undefined ? 'bradpeek@peekitservices.com' : process.env.LEAD_EMAIL_BCC;
 const SIGNATURE = process.env.LEAD_REPLY_SIGNATURE || 'Best regards,\n\nBrad Peek\nManaging Member | Peek Talent Solutions\n301-710-4423\nbradpeek@peekitservices.com\npeekitservices.com';
 const NETWORK_SIZE = process.env.LEAD_NETWORK_SIZE || '5,000+';
 
@@ -168,7 +170,7 @@ async function setLead(pool, id, fields) {
 async function sendLeadEmail(pool, lead, { kind, subject, body, status, extra = {} }, options = {}) {
   if (!lead.email) throw Object.assign(new Error('Lead has no email address'), { status: 400 });
   const fullBody = `${body.trim()}\n\n${SIGNATURE}`;
-  const result = await sendEmail({ to: lead.email, subject, text: fullBody, html: textToHtml(fullBody) }, options.sendOptions);
+  const result = await sendEmail({ to: lead.email, bcc: LEAD_BCC || undefined, subject, text: fullBody, html: textToHtml(fullBody) }, options.sendOptions);
   await logEmail(pool, lead, { direction: 'outbound', kind, subject, body: fullBody, to_email: lead.email, from_email: FROM_EMAIL });
   const now = new Date();
   const fields = { workflow_status: status, ...extra };
@@ -307,5 +309,5 @@ async function processFollowUps(pool, options = {}) {
 module.exports = {
   CRITICAL_FIELDS, missingInfo, addBusinessDays, draftOfferReply, templateOfferReply, analyzeInboundReply,
   closeOutEmail, followUpRequestEmail, sendLeadEmail, handleInboundReply, processFollowUps, createOpportunityFromLead,
-  logEmail, setLead, isAIConfigured, FOLLOW_UP_BUSINESS_DAYS, _setClientForTests, findOrCreateAccount, SIGNATURE,
+  logEmail, setLead, isAIConfigured, FOLLOW_UP_BUSINESS_DAYS, _setClientForTests, findOrCreateAccount, SIGNATURE, LEAD_BCC,
 };

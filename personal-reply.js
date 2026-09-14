@@ -186,7 +186,7 @@ function install(deps) {
     if (attach && !b.resume_markdown) return res.status(400).json({ error: 'resume_markdown is required when attaching the tailored resume' });
     const fullBody = `${String(b.body).trim()}\n\n${leadWorkflow.SIGNATURE}`;
     const filename = resumeFilename(user, lead);
-    const mail = { to: lead.email, subject: b.subject, text: fullBody, html: textToHtml(fullBody) };
+    const mail = { to: lead.email, bcc: leadWorkflow.LEAD_BCC || undefined, subject: b.subject, text: fullBody, html: textToHtml(fullBody) };
     if (attach) { mail.attachmentBuffer = await resumeDocx(b.resume_markdown, { name: user.name }); mail.attachmentFilename = filename; }
     const result = await sendEmail(mail);
     await leadWorkflow.logEmail(pool, lead, { direction: 'outbound', kind: 'personal_reply', subject: b.subject, body: fullBody + (attach ? `\n\n[Attached: ${filename}]` : ''), to_email: lead.email });
