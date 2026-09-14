@@ -146,7 +146,12 @@ async function fetchGmailMessages(pool, conn, { since, max = 50 } = {}, fetchImp
   const token = await accessTokenFor(pool, conn, fetchImpl);
   const H = { Authorization: `Bearer ${token}` };
   const d = new Date(since || Date.now() - 14 * 86400000);
-  const q = `in:inbox -in:spam -in:trash after:${d.getUTCFullYear()}/${d.getUTCMonth() + 1}/${d.getUTCDate()}`;
+  // Job-board blasts and system mail are excluded at the source so a long
+  // look-back stays within the message budget; the scanner's own prefilter
+  // and the AI classifier handle the rest.
+  const exclude = ['noreply', 'no-reply', 'donotreply', 'jobalerts', 'jobs-noreply', 'notifications', 'lensa.com', 'linkedin.com', 'indeed.com', 'dice.com', 'ziprecruiter.com', 'glassdoor.com', 'monster.com', 'jobhire.tech', 'jobcase.com', 'simplyhired.com', 'careerbuilder.com']
+    .map((s) => `-from:${s}`).join(' ');
+  const q = `in:inbox -in:spam -in:trash -category:promotions -category:social ${exclude} after:${d.getUTCFullYear()}/${d.getUTCMonth() + 1}/${d.getUTCDate()}`;
   const ids = []; let pageToken = null;
   while (ids.length < max) {
     const url = new URL('https://gmail.googleapis.com/gmail/v1/users/me/messages');

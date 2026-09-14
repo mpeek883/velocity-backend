@@ -1232,6 +1232,7 @@ app.get('/api/leads/scan/status', authenticateToken, async (req, res) => {
       ai_configured: leadScanner.isLeadAIConfigured(),
       scan_interval_minutes: LEAD_SCAN_INTERVAL_MIN,
       running: leadScanState.running,
+      last_error: leadScanState.last_error || null,
       last_run_at: leadScanState.last_run_at,
       last_result: leadScanState.last_result,
       messages_scanned_total: parseInt(counts.rows[0].scanned, 10) || 0,
@@ -1302,6 +1303,12 @@ app.post('/api/leads/scan', authenticateToken, async (req, res) => {
     const { days, max, mailbox } = req.body || {};
     const selected = mailbox ? boxes.filter((b) => b.address.toLowerCase() === String(mailbox).toLowerCase()) : boxes;
     if (!selected.length) return res.status(404).json({ error: `Mailbox ${mailbox} is not configured` });
+    if (req.body && req.body.background) {
+      if (leadScanState.running) return res.status(202).json({ started: false, running: true, message: 'A scan is already running' });
+      leadScanState.last_error = null;
+      runLeadScan({ mailboxes: selected, days, max }).catch((e) => { leadScanState.last_error = e.message; console.error('⚠️ Background lead scan failed:', e.message); });
+      return res.status(202).json({ started: true, running: true, days: Number(days) || undefined, mailboxes: selected.map((b) => b.address) });
+    }
     res.json(await runLeadScan({ mailboxes: selected, days, max }));
   } catch (err) {
     res.status(err.status || 500).json({ error: err.message });
