@@ -31,6 +31,26 @@ const DraftSchema = z.object({
 
 // Postgres refuses NUL bytes; PDF/DOCX extraction sometimes yields them plus other control characters.
 const cleanText = (t) => String(t || '').replace(/\u0000/g, '').replace(/[\u0001-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '').replace(/\r\n?/g, '\n').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+// Some PDFs carry a font encoding with no Unicode map, so the text layer is
+// gibberish. Detect that and let Claude read the pages instead.
+function textLooksReadable(text) {
+  const t = String(text || '');
+  if (t.length < 80) return false;
+  const letters = (t.match(/[A-Za-z]/g) || []).length;
+  const ratio = letters / Math.max(1, t.replace(/\s/g, '').length);
+  const words = t.toLowerCase().match(/\b[a-z]{2,}\b/g) || [];
+  const common = ['the', 'and', 'of', 'to', 'in', 'with', 'for', 'experience', 'management', 'years', 'team', 'skills', 'education', 'university', 'developed', 'led', 'project', 'projects', 'work', 'business', 'manager', 'senior', 'systems', 'services'];
+  const hits = new Set(words.filter((w) => common.includes(w))).size;
+  return ratio >= 0.7 && hits >= 4;
+}
+async function transcribePdf(buffer, { client } = {}) {
+  const c = client || getClient();
+  const res = await c.messages.create({ model: MODEL, max_tokens: 8000, messages: [{ role: 'user', content: [
+    { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: buffer.toString('base64') } },
+    { type: 'text', text: 'This is a resume. Transcribe its full text verbatim as plain text, in reading order, keeping section headings, job titles, employers, dates and bullet points (start bullets with "- "). Do not summarise, add or omit anything. Output only the transcription.' },
+  ] }] });
+  return (res.content || []).map((b) => b.text || '').join('\n').trim();
+}
 function baseResumeMissing() { const e = new Error('Add your base resume under Settings > My Profile first (paste it or upload a PDF/DOCX).'); e.status = 409; e.code = 'RESUME_REQUIRED'; throw e; }
 
 function templateDraft(lead, user) {
@@ -113,11 +133,19 @@ function install(deps) {
       try {
         if (uploadErr) return res.status(400).json({ error: uploadErr.code === 'LIMIT_FILE_SIZE' ? 'File is too large (max 5 MB).' : uploadErr.message });
         if (!req.file) return res.status(400).json({ error: 'Attach a PDF, DOCX or TXT file as "resume"' });
-        const text = cleanText(await extractText(req.file.buffer, req.file.originalname));
-        if (!text || text.length < 80) return res.status(400).json({ error: 'Could not read enough text from that file. Paste the resume text instead.' });
+        let text = cleanText(await extractText(req.file.buffer, req.file.originalname));
+        let method = 'text layer';
+        if (!textLooksReadable(text)) {
+          const isPdf = /\.pdf$/i.test(req.file.originalname) || req.file.mimetype === 'application/pdf';
+          if (isPdf && isAIConfigured()) {
+            try { text = cleanText(await transcribePdf(req.file.buffer)); method = 'read by AI (the PDF has no usable text layer)'; }
+            catch (e) { await events.record({ type: 'user.resume_transcribe_failed', entity_type: 'user', entity_id: req.user.id, result: 'error', error: e.message }); }
+          }
+          if (!textLooksReadable(text)) return res.status(400).json({ error: 'That file has no readable text layer (the letters come out scrambled). Save the resume as DOCX and upload that, or paste the text.', code: 'UNREADABLE' });
+        }
         await pool.query('UPDATE users SET resume_text=$1, resume_filename=$2, resume_updated_at=CURRENT_TIMESTAMP WHERE id::text=$3', [text.slice(0, 60000), req.file.originalname, String(req.user.id)]);
         await events.record({ type: 'user.resume_updated', entity_type: 'user', entity_id: req.user.id, actor: `user:${req.user.id}`, payload: { filename: req.file.originalname, chars: text.length } });
-        res.json({ ok: true, chars: text.length, resume_filename: req.file.originalname });
+        res.json({ ok: true, chars: text.length, resume_filename: req.file.originalname, method });
       } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
     });
   });
@@ -176,4 +204,4 @@ function install(deps) {
   return { draftPersonalReply, resumeDocx, resumeFilename, onPersonalInbound };
 }
 
-module.exports = { install, SCHEMA, draftPersonalReply, resumeDocx, resumeFilename, templateDraft, _setClientForTests, isAIConfigured, MODEL };
+module.exports = { install, SCHEMA, draftPersonalReply, resumeDocx, resumeFilename, templateDraft, textLooksReadable, transcribePdf, _setClientForTests, isAIConfigured, MODEL };
