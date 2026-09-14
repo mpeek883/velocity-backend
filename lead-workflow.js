@@ -252,10 +252,20 @@ async function handleInboundReply(pool, lead, msg, options = {}) {
       const r = await sendLeadEmail(pool, current, { kind: 'info_request', ...mail, status: 'awaiting_info', extra: { missing_info: JSON.stringify(missing.map((m) => m.key)) } }, options);
       return { action: 'info_requested', lead: r.lead, missing, analysis };
     }
-    const opp = await createOpportunityFromLead(pool, current, analysis);
-    current = await setLead(pool, current.id, { workflow_status: 'opportunity_created', opportunity_id: String(opp.id), follow_up_due_at: null, missing_info: '[]' });
+    if (process.env.LEAD_AUTO_CONVERT === 'true') {
+      // Legacy behaviour: convert without a human checkpoint.
+      const opp = await createOpportunityFromLead(pool, current, analysis);
+      current = await setLead(pool, current.id, { workflow_status: 'opportunity_created', opportunity_id: String(opp.id), follow_up_due_at: null, missing_info: '[]' });
+      if (module.exports.onLeadUpdated) { try { await module.exports.onLeadUpdated(current); } catch { /* mirror is best-effort */ } }
+      return { action: 'opportunity_created', lead: current, opportunity: opp, analysis };
+    }
+    // Authorize Search checkpoint: the recruiter is interested and every
+    // critical detail is on file, so a person now decides whether to open the
+    // search. Nothing is created until POST /api/leads/:id/authorize-search.
+    current = await setLead(pool, current.id, { workflow_status: 'ready_to_authorize', follow_up_due_at: null, missing_info: '[]' });
+    if (module.exports.onReadyToAuthorize) { try { await module.exports.onReadyToAuthorize(current, analysis); } catch (e) { console.error('⚠️ ready-to-authorize hook failed:', e.message); } }
     if (module.exports.onLeadUpdated) { try { await module.exports.onLeadUpdated(current); } catch { /* mirror is best-effort */ } }
-    return { action: 'opportunity_created', lead: current, opportunity: opp, analysis };
+    return { action: 'ready_to_authorize', lead: current, analysis };
   }
   // Unclear: keep waiting, but give them another window.
   current = await setLead(pool, current.id, { follow_up_due_at: addBusinessDays(new Date(), FOLLOW_UP_BUSINESS_DAYS) });
@@ -283,5 +293,5 @@ async function processFollowUps(pool, options = {}) {
 module.exports = {
   CRITICAL_FIELDS, missingInfo, addBusinessDays, draftOfferReply, templateOfferReply, analyzeInboundReply,
   closeOutEmail, followUpRequestEmail, sendLeadEmail, handleInboundReply, processFollowUps, createOpportunityFromLead,
-  logEmail, setLead, isAIConfigured, FOLLOW_UP_BUSINESS_DAYS, _setClientForTests,
+  logEmail, setLead, isAIConfigured, FOLLOW_UP_BUSINESS_DAYS, _setClientForTests, findOrCreateAccount,
 };

@@ -20,6 +20,10 @@ const leadAssignment = require('./lead-assignment');
 const matching = require('./matching');
 const sourcing = require('./sourcing');
 const workAuth = require('./work-auth');
+const { Events } = require('./events');
+const automation = require('./automation');
+const roles = require('./roles');
+let auto = null; // assigned when the automation routes are installed (below the core routes)
 
 // Resume uploads are held in memory (never written to disk) and capped at 5 MB.
 const resumeUpload = multer({
@@ -408,6 +412,7 @@ async function ensureSchema() {
     console.error('⚠️ Contacts backfill failed:', err.message);
   }
   await logSchemaSummary();
+  try { await auto.ensureSchema(); console.log('✅ Automation schema ready'); } catch (err) { console.error('⚠️ Automation schema failed:', err.message); }
 }
 
 
@@ -529,7 +534,7 @@ function sendDbError(res, err) {
 
 const CANDIDATE_COLS  = ['name', 'email', 'phone', 'title', 'company', 'location', 'skills', 'source', 'status',
                          'linkedin', 'experience_years', 'work_auth', 'availability', 'availability_date', 'desired_rate', 'desired_salary', 'resume_text', 'notes'];
-const JOB_ORDER_COLS  = ['title', 'company', 'location', 'description', 'salary_min', 'salary_max', 'salary_range', 'status', 'opportunity_id', 'account_id', 'priority', 'target_fill_date', 'required_skills',
+const JOB_ORDER_COLS  = ['title', 'company', 'location', 'description', 'salary_min', 'salary_max', 'salary_range', 'status', 'opportunity_id', 'account_id', 'priority', 'target_fill_date', 'required_skills', 'intake_status', 'source_of_truth', 'lead_id', 'created_by',
                          'source', 'url', 'apollo_job_id', 'apollo_org_id', 'posted_at', 'last_seen_at', 'last_synced_at'];
 const SUBMISSION_COLS = ['candidate_id', 'job_order_id', 'status', 'notes', 'created_by'];
 const LEAD_COLS       = ['name', 'title', 'company', 'company_address', 'company_website', 'email', 'phone', 'linkedin', 'source', 'status', 'territory', 'score',
@@ -544,6 +549,9 @@ const ACTIVITY_COLS   = ['type', 'title', 'contact', 'account', 'due_at', 'statu
 app.use(helmet());
 app.use(cors());
 app.use(express.json());
+// Role enforcement: viewers are read-only on every write route (see roles.js).
+const roleGuard = roles.enforce({ pool, jwt, secret: () => JWT_SECRET });
+app.use(roleGuard);
 
 // ====== JWT AUTHENTICATION MIDDLEWARE ======
 const authenticateToken = (req, res, next) => {
@@ -1160,9 +1168,11 @@ async function afterLeadCreated(row, { assignTo } = {}) {
   try { lead = (await assignRecordNumber('leads', lead.id)) || lead; } catch (e) { console.error('⚠️ Lead numbering failed:', e.message); }
   try { const a = await leadAssignment.assignLead(pool, lead, assignTo || null); if (a.lead) lead = a.lead; } catch (e) { console.error('⚠️ Lead assignment failed:', e.message); }
   try { await contactsSync.syncContactFromLead(pool, lead); } catch (e) { console.error('⚠️ Contact sync (lead) failed:', e.message); }
+  auto.events.record({ type: 'lead.created', entity_type: 'lead', entity_id: lead.id, actor: lead.origin === 'system' ? 'lead-scanner' : 'user', payload: { lead_no: lead.lead_no, source: lead.source, assigned_to: lead.assigned_to } });
   return lead;
 }
 leadScanner.onLeadCreated = (row) => afterLeadCreated(row);
+leadWorkflow.onReadyToAuthorize = (row) => auto.onLeadReadyToAuthorize(row);
 leadScanner.onLeadUpdated = (row) => contactsSync.syncContactFromLead(pool, row).catch(() => {});
 leadWorkflow.onLeadUpdated = (row) => contactsSync.syncContactFromLead(pool, row).catch(() => {});
 
@@ -1427,7 +1437,7 @@ app.post('/api/leads/repair-conversations', authenticateToken, async (req, res) 
       const offer = all.filter((x) => x.direction === 'outbound' && x.kind === 'offer_reply').pop();
       const closeOut = all.find((x) => x.kind === 'close_out');
       const inbound = all.filter((x) => x.direction === 'inbound' && x.kind !== 'outreach').pop();
-      if (!offer || ['opportunity_created', 'declined', 'closed_no_response'].includes(lead.workflow_status)) continue;
+      if (!offer || ['opportunity_created', 'ready_to_authorize', 'declined', 'closed_no_response'].includes(lead.workflow_status)) continue;
       const missing = leadWorkflow.missingInfo(lead);
       const status = closeOut ? 'closed_no_response' : (missing.length ? 'awaiting_info' : 'replied');
       const fields = { workflow_status: status, reviewed_at: lead.reviewed_at || offer.created_at, replied_at: offer.created_at, follow_up_due_at: closeOut ? null : leadWorkflow.addBusinessDays(new Date(inbound && inbound.created_at > offer.created_at ? inbound.created_at : offer.created_at), leadWorkflow.FOLLOW_UP_BUSINESS_DAYS), missing_info: JSON.stringify(missing.map((m) => m.key)), last_inbound_at: inbound ? inbound.created_at : lead.last_inbound_at };
@@ -1485,6 +1495,7 @@ app.post('/api/leads/:id/review', authenticateToken, async (req, res) => {
       reviewed_at: lead.reviewed_at || new Date(),
       missing_info: JSON.stringify(draft.missing.map((m) => m.key)),
     });
+    auto.audit('lead.reviewed', 'lead', lead.id, req, { missing: draft.missing.map((m) => m.key) });
     res.json({ lead: updated, draft: { subject: draft.subject, body: draft.body, model: draft.model }, missing: draft.missing });
   } catch (err) {
     res.status(err.status || 502).json({ error: err.message, code: err.code });
@@ -1503,6 +1514,7 @@ app.post('/api/leads/:id/reply', authenticateToken, async (req, res) => {
       status: missing.length ? 'awaiting_info' : 'replied',
       extra: { missing_info: JSON.stringify(missing.map((m) => m.key)) },
     });
+    auto.audit('lead.replied', 'lead', lead.id, req, { transport: result.transport, status: result.lead && result.lead.workflow_status });
     res.json({ ok: true, transport: result.transport, lead: result.lead, missing });
   } catch (err) {
     res.status(err.status || 502).json({ error: err.message, code: err.code });
@@ -1515,6 +1527,7 @@ app.post('/api/leads/:id/close-out', authenticateToken, async (req, res) => {
     if (!lead) return res.status(404).json({ error: 'Lead not found' });
     const mail = leadWorkflow.closeOutEmail(lead);
     const result = await leadWorkflow.sendLeadEmail(pool, lead, { kind: 'close_out', ...mail, status: (req.body && req.body.status) || 'declined' });
+    auto.audit('lead.closed_out', 'lead', lead.id, req, { status: (req.body && req.body.status) || 'declined' });
     res.json({ ok: true, transport: result.transport, lead: result.lead });
   } catch (err) {
     res.status(err.status || 502).json({ error: err.message, code: err.code });
@@ -1630,6 +1643,7 @@ app.post('/api/opportunities/:id/job-order', authenticateToken, async (req, res)
     }
     await pool.query('INSERT INTO activities (type, title, account, opportunity_id, account_id, status, completed_at, created_by) VALUES ($1,$2,$3,$4,$5,$6,CURRENT_TIMESTAMP,$7)',
       ['Task', `Job order created: ${body.title}`, body.company, String(o.id), body.account_id, 'completed', String(req.user.id)]).catch(() => {});
+    auto.audit('job_order.created', 'job_order', row.id, req, { from: 'opportunity', opportunity_id: String(o.id) });
     res.status(201).json({ ...row, opportunity_no: o.opportunity_no, opportunity_name: o.name });
   } catch (err) { sendDbError(res, err); }
 });
@@ -1891,7 +1905,15 @@ app.get('/api/submissions', authenticateToken, async (req, res) => {
 
 app.post('/api/submissions', authenticateToken, async (req, res) => {
   try {
-    res.status(201).json(await insertRow('submissions', SUBMISSION_COLS, { ...(req.body || {}), created_by: String(req.user.id) }));
+    const body = { ...(req.body || {}), created_by: String(req.user.id) };
+    const status = automation.normalizeSubmissionStatus(body.status);
+    if (!status) return res.status(400).json({ error: `Unknown submission status "${body.status}"`, code: 'INVALID_STATUS', allowed: automation.STATUS_IDS });
+    if (status === 'hired' && !body.override) return res.status(409).json({ error: 'Create the submission first, then record the placement to mark it hired.', code: 'USE_PLACEMENT' });
+    body.status = status;
+    const row = await insertRow('submissions', SUBMISSION_COLS, body);
+    await pool.query('UPDATE submissions SET stage_changed_at=CURRENT_TIMESTAMP WHERE id=$1', [row.id]).catch(() => {});
+    auto.audit('submission.created', 'submission', row.id, req, { candidate_id: row.candidate_id, job_order_id: row.job_order_id, status });
+    res.status(201).json(row);
   } catch (err) {
     sendDbError(res, err);
   }
@@ -1899,10 +1921,13 @@ app.post('/api/submissions', authenticateToken, async (req, res) => {
 
 app.put('/api/submissions/:id', authenticateToken, async (req, res) => {
   try {
-    const row = await updateRow('submissions', SUBMISSION_COLS, req.params.id, req.body);
+    const { status, override, override_reason, note, ...rest } = req.body || {};
+    let row = Object.keys(rest).length ? await updateRow('submissions', SUBMISSION_COLS, req.params.id, rest) : (await pool.query('SELECT * FROM submissions WHERE id::text=$1', [String(req.params.id)])).rows[0];
     if (!row) return res.status(404).json({ error: 'Submission not found' });
+    if (status !== undefined) row = await auto.applySubmissionStatus(row, status, { req, note, override: !!override, reason: override_reason });
     res.json(row);
   } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message, code: err.code });
     sendDbError(res, err);
   }
 });
@@ -1940,9 +1965,12 @@ app.post('/api/placements', authenticateToken, async (req, res) => {
       if (!body.candidate_id) body.candidate_id = sub.candidate_id;
       if (!body.job_order_id) body.job_order_id = sub.job_order_id;
     }
+    if (sub) { const gate = auto.placementGate(sub, body); if (gate) return res.status(gate.status).json(gate); }
     body.created_by = String(req.user.id);
     if (body.end_date && !body.initial_end_date) body.initial_end_date = body.end_date;
-    const row = await insertRow('placements', PLACEMENT_COLS, body);
+    const { override, override_reason, ...clean } = body;
+    const row = await insertRow('placements', PLACEMENT_COLS, clean);
+    auto.afterPlacement(row, sub, req).catch(() => {});
     if (sub) {
       await pool.query("UPDATE submissions SET status='hired', updated_at=CURRENT_TIMESTAMP WHERE id=$1", [sub.id]).catch(() => {});
       await pool.query("UPDATE job_orders SET status='filled', updated_at=CURRENT_TIMESTAMP WHERE id=$1 AND COALESCE(status,'open') NOT IN ('filled','closed','cancelled')", [sub.job_order_id]).catch(() => {});
@@ -2037,9 +2065,9 @@ app.get('/api/analytics', authenticateToken, async (req, res) => {
 const days = (a, b) => (a && b ? (new Date(b) - new Date(a)) / 86400000 : null);
 const avg = (arr) => { const v = arr.filter((x) => x != null && !Number.isNaN(x)); return v.length ? Math.round((v.reduce((s, x) => s + x, 0) / v.length) * 10) / 10 : null; };
 const pct = (n, d) => (d ? Math.round((n / d) * 1000) / 10 : null);
-const INTERVIEW_STAGES = ['phone screen', 'screening', 'technical', 'interview', 'hiring manager', 'final round', 'offer', 'hired', 'placed'];
-const OFFER_STAGES = ['offer', 'hired', 'placed'];
-const ACCEPTED_STAGES = ['hired', 'placed'];
+const INTERVIEW_STAGES = ['phone screen', 'screening', 'technical', 'interview', 'hiring manager', 'final round', 'offer', 'hired', 'placed', ...automation.INTERVIEW_OR_LATER];
+const OFFER_STAGES = ['offer', 'hired', 'placed', ...automation.OFFER_OR_LATER];
+const ACCEPTED_STAGES = ['hired', 'placed', ...automation.ACCEPTED_OR_LATER];
 app.get('/api/metrics', authenticateToken, async (req, res) => {
   try {
     const [opps, leads, acts, users, cands, jobs, subs, places] = await Promise.all([
@@ -2293,6 +2321,16 @@ app.get('/', (req, res) => {
 });
 
 // ====== ERROR HANDLERS ======
+// ====== AUTOMATION: audit trail, checkpoints, client links, interviews, offers, e-signature ======
+// (auto is declared with `var` hoisting semantics via the function below so the
+// routes above can call auto.* at request time; install runs synchronously here.)
+auto = automation.install({
+  app, pool, events: new Events(pool), authenticateToken, requireAdmin, sendEmail, isEmailConfigured, insertRow, JOB_ORDER_COLS,
+  markdownToHtml, buildCandidateProfile, isProfileAIConfigured, leadWorkflow, contactsSync, roleCache: roleGuard.roles,
+});
+// Users & roles changes must clear the cached role.
+app.use('/api/users', (req, res, next) => { if (!['GET', 'HEAD'].includes(req.method)) roleGuard.roles.clear(); next(); });
+
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
 });
@@ -2312,6 +2350,7 @@ app.listen(PORT, () => {
   console.log('🛠️ Database Setup: GET /api/setup/init-db\n');
   startApolloSyncScheduler();
   startLeadScanScheduler();
+  auto.startJobRunner();
 });
 
 module.exports = { app, syncApolloJobOrders };
