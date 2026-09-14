@@ -227,7 +227,20 @@ function leadFromExtraction(msg, box, ex) {
     message_id: msg.message_id,
     email_subject: msg.subject,
     email_received_at: msg.received_at || null,
+    // The original email, kept verbatim (trimmed) so the lead form can show it.
+    email_from: msg.from_name ? `${msg.from_name} <${msg.from_email}>` : msg.from_email,
+    email_body: String(msg.text || '').slice(0, 20000),
   };
+}
+
+/** Keep the original outreach in the lead's conversation log. */
+async function logOutreach(pool, leadId, lead) {
+  try {
+    await pool.query(
+      `INSERT INTO lead_emails (lead_id, direction, kind, subject, body, message_id, from_email, to_email)
+       VALUES ($1,'inbound','outreach',$2,$3,$4,$5,$6)`,
+      [String(leadId), lead.email_subject || '', lead.email_body || '', lead.message_id || null, lead.email || null, lead.mailbox || null]);
+  } catch { /* logging only */ }
 }
 
 /**
@@ -308,17 +321,20 @@ async function scanMailboxes(deps) {
                 notes: [cur.notes, '---', lead.notes].filter(Boolean).join('\n'),
                 score: Math.max(Number(cur.score) || 0, lead.score),
                 mailbox: lead.mailbox, message_id: lead.message_id, email_subject: lead.email_subject, email_received_at: lead.email_received_at,
+                email_from: lead.email_from, email_body: lead.email_body,
               };
               const cols = Object.keys(merged);
               await pool.query(
                 `UPDATE leads SET ${cols.map((c, i) => `${c}=$${i + 1}`).join(', ')}, updated_at=CURRENT_TIMESTAMP WHERE id=$${cols.length + 1}`,
                 [...cols.map((c) => merged[c]), cur.id]);
               leadId = cur.id; r.leads_updated += 1; summary.leads_updated += 1;
+              await logOutreach(pool, leadId, lead);
               if (module.exports.onLeadUpdated) { try { await module.exports.onLeadUpdated({ ...cur, ...merged, id: cur.id }); } catch (e) { r.errors.push(`post-update hook: ${e.message}`); } }
             } else {
               const cols = Object.keys(lead);
               const ins = await pool.query(`INSERT INTO leads (${cols.join(', ')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING *`, cols.map((c) => lead[c]));
               leadId = ins.rows[0].id; r.leads_created += 1; summary.leads_created += 1;
+              await logOutreach(pool, leadId, lead);
               if (module.exports.onLeadCreated) { try { await module.exports.onLeadCreated(ins.rows[0]); } catch (e) { r.errors.push(`post-create hook: ${e.message}`); } }
             }
           } else {

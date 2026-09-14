@@ -48,7 +48,7 @@ const REQUIRED_COLUMNS = {
     email_received_at: 'TIMESTAMP', workflow_status: "VARCHAR(50) DEFAULT 'new'", end_client: 'VARCHAR(255)', employment_type: 'VARCHAR(50)',
     work_arrangement: 'VARCHAR(50)', missing_info: 'TEXT', reviewed_at: 'TIMESTAMP', replied_at: 'TIMESTAMP', last_inbound_at: 'TIMESTAMP',
     follow_up_due_at: 'TIMESTAMP', opportunity_id: 'TEXT', account_id: 'TEXT', origin: "VARCHAR(20) DEFAULT 'manual'",
-    lead_no: 'INTEGER', assigned_to: 'TEXT', assigned_at: 'TIMESTAMP',
+    lead_no: 'INTEGER', assigned_to: 'TEXT', assigned_at: 'TIMESTAMP', email_from: 'VARCHAR(255)', email_body: 'TEXT',
     created_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP', updated_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
   },
   opportunities: {
@@ -59,7 +59,11 @@ const REQUIRED_COLUMNS = {
     opportunity_no: 'INTEGER',
     created_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP', updated_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
   },
-  accounts: { name: 'VARCHAR(255)', industry: 'VARCHAR(100)', size: 'VARCHAR(50)', website: 'VARCHAR(255)', billing_contact: 'VARCHAR(255)', account_no: 'INTEGER', created_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP', updated_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' },
+  accounts: {
+    name: 'VARCHAR(255)', industry: 'VARCHAR(100)', size: 'VARCHAR(50)', website: 'VARCHAR(255)', billing_contact: 'VARCHAR(255)', account_no: 'INTEGER',
+    revenue: 'VARCHAR(50)', employees: 'VARCHAR(50)', tier: 'VARCHAR(50)', city: 'VARCHAR(100)', state: 'VARCHAR(50)', description: 'TEXT',
+    created_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP', updated_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+  },
   contacts: {
     name: 'VARCHAR(255)', email: 'VARCHAR(255)', phone: 'VARCHAR(50)', company: 'VARCHAR(255)', title: 'VARCHAR(255)',
     contact_type: 'VARCHAR(20)', skills: 'TEXT', candidate_id: 'TEXT', lead_id: 'TEXT', account_id: 'TEXT', source: 'VARCHAR(100)', status: "VARCHAR(50) DEFAULT 'active'", score: 'INTEGER', notes: 'TEXT',
@@ -410,7 +414,7 @@ const JOB_ORDER_COLS  = ['title', 'company', 'location', 'description', 'salary_
 const SUBMISSION_COLS = ['candidate_id', 'job_order_id', 'status', 'notes'];
 const LEAD_COLS       = ['name', 'title', 'company', 'company_address', 'company_website', 'email', 'phone', 'linkedin', 'source', 'status', 'territory', 'score',
                          'job_title', 'job_location', 'job_description', 'rate_or_salary', 'notes',
-                         'end_client', 'employment_type', 'work_arrangement', 'workflow_status'];
+                         'end_client', 'employment_type', 'work_arrangement', 'workflow_status', 'email_subject', 'email_from', 'email_body', 'email_received_at'];
 const OPP_COLS        = ['name', 'account', 'contact', 'contact_email', 'value', 'stage', 'probability', 'close_date', 'type', 'competitor', 'notes', 'forecast_category', 'win_loss_reason',
                          'job_title', 'job_description', 'client_name', 'rate', 'work_location', 'work_arrangement', 'lead_id'];
 const PLACEMENT_COLS  = ['submission_id', 'candidate_id', 'job_order_id', 'start_date', 'end_date', 'fee_amount', 'placement_status'];
@@ -692,16 +696,32 @@ app.get('/api/accounts', authenticateToken, async (req, res) => {
   }
 });
 
+const ACCOUNT_COLS = ['name', 'industry', 'size', 'website', 'billing_contact', 'revenue', 'employees', 'tier', 'city', 'state', 'description'];
 app.post('/api/accounts', authenticateToken, async (req, res) => {
   try {
-    const { name, industry, size, website, billing_contact } = req.body;
-    const result = await pool.query(
-      'INSERT INTO accounts (name, industry, size, website, billing_contact) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [name, industry, size, website, billing_contact]
-    );
-    res.status(201).json((await assignRecordNumber('accounts', result.rows[0].id)) || result.rows[0]);
+    if (!req.body || !req.body.name) return res.status(400).json({ error: 'name is required' });
+    const row = await insertRow('accounts', ACCOUNT_COLS, req.body);
+    res.status(201).json((await assignRecordNumber('accounts', row.id)) || row);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendDbError(res, err);
+  }
+});
+app.put('/api/accounts/:id', authenticateToken, async (req, res) => {
+  try {
+    const row = await updateRow('accounts', ACCOUNT_COLS, req.params.id, req.body || {});
+    if (!row) return res.status(404).json({ error: 'Account not found' });
+    res.json(row);
+  } catch (err) {
+    sendDbError(res, err);
+  }
+});
+app.delete('/api/accounts/:id', authenticateToken, async (req, res) => {
+  try {
+    const q = await pool.query('DELETE FROM accounts WHERE id::text=$1 RETURNING id', [String(req.params.id)]);
+    if (!q.rows.length) return res.status(404).json({ error: 'Account not found' });
+    res.json({ message: 'Deleted' });
+  } catch (err) {
+    sendDbError(res, err);
   }
 });
 
