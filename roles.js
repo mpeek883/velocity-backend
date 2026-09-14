@@ -9,7 +9,7 @@
 // table and cached briefly. Public endpoints (login, intake / client-review
 // links, e-signature webhooks) are never gated here.
 
-const PUBLIC_PREFIXES = ['/api/auth/', '/api/login', '/api/register', '/api/intake/', '/api/client/', '/api/esign/webhook', '/api/integrations/', '/api/setup/', '/api/health'];
+const PUBLIC_PREFIXES = ['/api/auth/', '/api/login', '/api/register', '/api/intake/', '/api/client/', '/api/candidate/', '/api/feedback/', '/api/timesheet/', '/api/timesheet-approval/', '/api/quickbooks/callback', '/api/esign/webhook', '/api/integrations/', '/api/setup/', '/api/health'];
 const SELF_SERVICE = ['/api/users/me/password', '/api/notifications', '/api/ai/chat', '/api/logout'];
 
 const ROLE_CAN_WRITE = { admin: true, recruiter: true, sales: true, viewer: false };
@@ -19,6 +19,22 @@ const PERMISSIONS = {
   sales: { write: true, manage_users: false, override_gates: true, label: 'Sales' },
   viewer: { write: false, manage_users: false, override_gates: false, label: 'Viewer (read-only)' },
 };
+// Write paths each non-admin role may NOT touch. Everything else a writing role can write.
+const DENY = {
+  sales: [/^\/api\/(candidates|submissions|placements|timesheets|interviews|offers|invoices|outreach|sourcing)(\/|$)/, /^\/api\/job-orders\/[^/]+\/outreach/, /^\/api\/esign\/requests$/],
+  recruiter: [/^\/api\/invoices\/[^/]+\/(mark-paid|push)$/, /^\/api\/quickbooks\/(connect|connection)(\/|$)/, /^\/api\/digest\/send/, /^\/api\/maintenance/, /^\/api\/duplicates\/scan/],
+  viewer: [/^\/api\//],
+};
+// Human-readable matrix for the Users & Roles screen.
+const MATRIX = {
+  admin: { label: 'Admin', can: ['Everything', 'Add users and change roles', 'Edit or delete any record', 'QuickBooks connection, invoices, digests, maintenance'] },
+  recruiter: { label: 'Recruiter', can: ['Leads, opportunities, accounts, contacts, activities', 'Candidates, job orders, submissions, interviews, offers, placements', 'Client links, outreach, e-signature, timesheets', 'Edit or delete only records they own (assigned or created)'], cannot: ['Users & roles', 'QuickBooks connection, marking invoices paid', 'Weekly digest and maintenance runs'] },
+  sales: { label: 'Sales', can: ['Leads, opportunities, accounts, contacts, activities, contracts', 'Job orders and client intake', 'NDA and SOW e-signature', 'Edit or delete only records they own'], cannot: ['Candidates, submissions, interviews, offers, placements, outreach', 'Timesheets and invoices', 'Users & roles'] },
+  viewer: { label: 'Viewer', can: ['Read every screen'], cannot: ['Any change'] },
+};
+// Record ownership: non-admins can only change records they own (when an owner is set).
+const OWNED = { leads: ['leads', 'assigned_to'], activities: ['activities', 'created_by'], submissions: ['submissions', 'created_by'], 'job-orders': ['job_orders', 'created_by'], placements: ['placements', 'created_by'] };
+const OWNED_RE = /^\/api\/(leads|activities|submissions|job-orders|placements)\/([^/]+)(\/assign)?$/;
 
 function createRoleCache(pool, ttlMs = 60000) {
   const cache = new Map();
@@ -64,10 +80,22 @@ function enforce({ pool, jwt, secret, cache }) {
     if (role === 'inactive') return res.status(403).json({ error: 'This account has been deactivated', code: 'INACTIVE' });
     if (ROLE_CAN_WRITE[role] === false) return res.status(403).json({ error: 'Your role is read-only. Ask an admin for recruiter or sales access to make changes.', code: 'READ_ONLY_ROLE', role });
     req.userRole = role;
+    if (role !== 'admin') {
+      if ((DENY[role] || []).some((re) => re.test(p))) return res.status(403).json({ error: `Your role (${role}) cannot change this. ${role === 'sales' ? 'Candidate, submission and placement changes belong to recruiters.' : 'Ask an admin.'}`, code: 'ROLE_DENIED', role });
+      const m = p.match(OWNED_RE);
+      if (m && process.env.OWNERSHIP_MODE !== 'off' && (['PUT', 'DELETE', 'PATCH'].includes(req.method) || m[3])) {
+        const [table, col] = OWNED[m[1]];
+        try {
+          const q = await pool.query(`SELECT ${col} AS owner FROM ${table} WHERE id::text=$1`, [String(m[2])]);
+          const owner = q.rows.length ? q.rows[0].owner : null;
+          if (owner != null && String(owner) !== String(user.id)) return res.status(403).json({ error: 'This record belongs to another team member. Ask them or an admin to change it.', code: 'NOT_OWNER' });
+        } catch { /* unknown column (legacy schema): allow */ }
+      }
+    }
     next();
   };
   mw.roles = roles;
   return mw;
 }
 
-module.exports = { enforce, createRoleCache, PERMISSIONS, ROLE_CAN_WRITE, PUBLIC_PREFIXES };
+module.exports = { enforce, createRoleCache, PERMISSIONS, ROLE_CAN_WRITE, PUBLIC_PREFIXES, DENY, MATRIX, OWNED };

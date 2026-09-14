@@ -9,7 +9,9 @@
 //   - e-signature requests (NDA / RTR / SOW) with webhook status updates
 //   - audit routes: events, exceptions, jobs, summary
 const esign = require('./esign');
+const dedupe = require('./dedupe');
 const { Events, parse } = require('./events');
+const EXTRA_SCHEMA = [...require('./watchdog').SCHEMA, ...require('./outreach').SCHEMA, ...require('./timesheets').SCHEMA, ...dedupe.SCHEMA];
 
 const APP_URL = (process.env.APP_URL || 'https://velocity-i5hx.onrender.com').replace(/\/$/, '');
 const COMPANY = esign.COMPANY;
@@ -71,6 +73,16 @@ const SCHEMA = [
   'ALTER TABLE submissions ADD COLUMN IF NOT EXISTS contract_status VARCHAR(20)',
   'ALTER TABLE accounts ADD COLUMN IF NOT EXISTS nda_status VARCHAR(20)',
   'ALTER TABLE accounts ADD COLUMN IF NOT EXISTS nda_signed_at TIMESTAMP',
+  'ALTER TABLE interview_rounds ADD COLUMN IF NOT EXISTS interviewer_email VARCHAR(255)',
+  'ALTER TABLE interview_rounds ADD COLUMN IF NOT EXISTS location VARCHAR(255)',
+  'ALTER TABLE interview_rounds ADD COLUMN IF NOT EXISTS duration_minutes INTEGER',
+  'ALTER TABLE interview_rounds ADD COLUMN IF NOT EXISTS feedback_token VARCHAR(80)',
+  'ALTER TABLE interview_rounds ADD COLUMN IF NOT EXISTS rating INTEGER',
+  'ALTER TABLE interview_rounds ADD COLUMN IF NOT EXISTS recommendation VARCHAR(20)',
+  'ALTER TABLE interview_rounds ADD COLUMN IF NOT EXISTS feedback_submitted_at TIMESTAMP',
+  'ALTER TABLE interview_rounds ADD COLUMN IF NOT EXISTS invite_sent_at TIMESTAMP',
+  'ALTER TABLE interview_rounds ADD COLUMN IF NOT EXISTS calendar_uid VARCHAR(120)',
+  'ALTER TABLE placements ADD COLUMN IF NOT EXISTS created_by TEXT',
 ];
 
 const tokenUrl = (kind, token) => `${APP_URL}/?${kind}=${encodeURIComponent(token)}`;
@@ -86,7 +98,7 @@ function install(deps) {
 
   async function ensureSchema() {
     await events.ensureSchema();
-    for (const sql of SCHEMA) { try { await pool.query(sql); } catch (e) { if (!/already exists|not supported/i.test(e.message)) console.error('⚠️ automation schema:', sql.slice(0, 60), '-', e.message.split('\n')[0]); } }
+    for (const sql of [...SCHEMA, ...EXTRA_SCHEMA]) { try { await pool.query(sql); } catch (e) { if (!/already exists|not supported/i.test(e.message)) console.error('⚠️ automation schema:', sql.slice(0, 60), '-', e.message.split('\n')[0]); } }
   }
 
   const one = async (sql, params) => (await pool.query(sql, params)).rows[0] || null;
@@ -106,7 +118,7 @@ function install(deps) {
   async function notify({ user_ids = [], roles = [], type, title, body = '', link = null, entity_type = null, entity_id = null, email = true, exclude = null }) {
     const ids = new Set(user_ids.filter((x) => x != null).map(String));
     if (roles.length) {
-      try { const q = await pool.query('SELECT id FROM users WHERE is_active IS DISTINCT FROM FALSE'); for (const u of q.rows) { const r = await roleCache.roleFor(u.id); if (roles.includes(r)) ids.add(String(u.id)); } } catch { /* */ }
+      try { const q = await pool.query('SELECT id FROM users WHERE COALESCE(is_active, TRUE) = TRUE'); for (const u of q.rows) { const r = await roleCache.roleFor(u.id); if (roles.includes(r)) ids.add(String(u.id)); } } catch { /* */ }
     }
     if (exclude != null) ids.delete(String(exclude));
     if (!ids.size) return [];
@@ -134,9 +146,9 @@ function install(deps) {
       await pool.query('UPDATE notifications SET emailed_at=CURRENT_TIMESTAMP WHERE id=$1', [n.id]);
       return 'sent';
     },
-    'email.send': async ({ to, subject, html, text, entity_type, entity_id }) => {
+    'email.send': async ({ to, subject, html, text, entity_type, entity_id, attachment_base64, attachment_filename }) => {
       if (!isEmailConfigured()) throw new Error('Email is not configured on the API service (SMTP_* or Microsoft Graph)');
-      const r = await sendEmail({ to, subject, html, text });
+      const r = await sendEmail({ to, subject, html, text, ...(attachment_base64 && attachment_filename ? { attachmentBuffer: Buffer.from(attachment_base64, 'base64'), attachmentFilename: attachment_filename } : {}) });
       await events.record({ type: 'email.sent', entity_type, entity_id, payload: { to, subject, transport: r && r.transport } });
       return r;
     },
@@ -165,11 +177,59 @@ function install(deps) {
       return s.status;
     },
   };
+  workers['interview.invite'] = async ({ interview_id }) => {
+    const ir = await one('SELECT * FROM interview_rounds WHERE id=$1', [interview_id]);
+    if (!ir || !ir.scheduled_at || ir.status === 'cancelled') return 'skip';
+    const sub = await loadSubmission(ir.submission_id); if (!sub) return 'no submission';
+    const cand = await loadCandidate(sub.candidate_id); const job = await loadJobOrder(sub.job_order_id);
+    const uid = ir.calendar_uid || `velocity-interview-${ir.id}@${(APP_URL.replace(/^https?:\/\//, ''))}`;
+    const ics = buildIcs({ uid, start: new Date(ir.scheduled_at), minutes: ir.duration_minutes || 60, summary: `Interview: ${cand ? cand.name : 'Candidate'} - ${job ? job.title : 'role'} (round ${ir.round})`, description: `${ir.type || 'Interview'}${ir.interviewer ? ` with ${ir.interviewer}` : ''}. Arranged by ${COMPANY}.`, location: ir.location || '', attendees: [cand && cand.email, ir.interviewer_email].filter(Boolean) });
+    const when = new Date(ir.scheduled_at).toLocaleString('en-US', { dateStyle: 'full', timeStyle: 'short' });
+    let sent = [];
+    if (cand && cand.email) {
+      await events.enqueue('email.send', { to: cand.email, subject: `Interview confirmed: ${job ? job.title : 'role'}, ${when}`, html: `<p>Hi ${esc(cand.name.split(' ')[0])},</p><p>Your round ${ir.round} interview${job ? ` for <strong>${esc(job.title)}</strong>` : ''} is set for <strong>${esc(when)}</strong>${ir.interviewer ? ` with ${esc(ir.interviewer)}` : ''}${ir.location ? ` (${esc(ir.location)})` : ''}. A calendar invitation is attached.</p><h3>How to prepare</h3><ul><li>Re-read the job description and pick two or three examples from your work that match the must-have skills${job && job.required_skills ? ` (${esc(job.required_skills)})` : ''}.</li><li>Be ready to walk through your most recent project: the problem, what you did, the result.</li><li>Have two questions ready about the team and the first 90 days.</li><li>Join five minutes early; if anything changes, reply to this email.</li></ul><p>Good luck,<br/>${esc(COMPANY)}</p>`, text: `Interview round ${ir.round} for ${job ? job.title : 'role'}: ${when}.`, attachment_base64: Buffer.from(ics).toString('base64'), attachment_filename: 'interview.ics', entity_type: 'submission', entity_id: sub.id }, { dedupeKey: `interview.invite.cand:${ir.id}:${new Date(ir.scheduled_at).getTime()}`, maxAttempts: 3 });
+      sent.push('candidate');
+    }
+    if (ir.interviewer_email) {
+      const fb = `${APP_URL}/?feedback=${ir.feedback_token}`;
+      await events.enqueue('email.send', { to: ir.interviewer_email, subject: `Interview scheduled: ${cand ? cand.name : 'candidate'} for ${job ? job.title : 'role'}, ${when}`, html: `<p>Hello${ir.interviewer ? ` ${esc(ir.interviewer)}` : ''},</p><p>Round ${ir.round} with <strong>${esc(cand ? cand.name : 'the candidate')}</strong>${job ? ` for ${esc(job.title)}` : ''} is set for <strong>${esc(when)}</strong>${ir.location ? ` (${esc(ir.location)})` : ''}. A calendar invitation is attached.</p><p>After the interview, please leave your feedback here (two minutes):</p><p><a href="${esc(fb)}" style="background:#4f46e5;color:#fff;padding:10px 16px;border-radius:8px;text-decoration:none">Give feedback</a></p><p>${esc(COMPANY)}</p>`, text: `Interview ${when}. Feedback: ${fb}`, attachment_base64: Buffer.from(ics).toString('base64'), attachment_filename: 'interview.ics', entity_type: 'submission', entity_id: sub.id }, { dedupeKey: `interview.invite.int:${ir.id}:${new Date(ir.scheduled_at).getTime()}`, maxAttempts: 3 });
+      sent.push('interviewer');
+    }
+    await pool.query('UPDATE interview_rounds SET invite_sent_at=CURRENT_TIMESTAMP, calendar_uid=$1 WHERE id=$2', [uid, ir.id]);
+    await events.record({ type: 'interview.invited', entity_type: 'submission', entity_id: sub.id, payload: { round: ir.round, sent, scheduled_at: ir.scheduled_at } });
+    return sent.join('+') || 'nobody to invite';
+  };
+  workers['interview.reminder'] = async ({ interview_id }) => {
+    const ir = await one('SELECT * FROM interview_rounds WHERE id=$1', [interview_id]);
+    if (!ir || ir.status !== 'scheduled') return 'skip';
+    const sub = await loadSubmission(ir.submission_id); const cand = sub ? await loadCandidate(sub.candidate_id) : null; const job = sub ? await loadJobOrder(sub.job_order_id) : null;
+    const when = new Date(ir.scheduled_at).toLocaleString('en-US', { dateStyle: 'full', timeStyle: 'short' });
+    if (cand && cand.email) await events.enqueue('email.send', { to: cand.email, subject: `Reminder: interview tomorrow, ${when}`, html: `<p>Hi ${esc(cand.name.split(' ')[0])}, a reminder that your round ${ir.round} interview${job ? ` for ${esc(job.title)}` : ''} is ${esc(when)}${ir.location ? ` (${esc(ir.location)})` : ''}. Reply if anything has changed.</p><p>${esc(COMPANY)}</p>`, text: `Reminder: interview ${when}`, entity_type: 'submission', entity_id: sub.id }, { dedupeKey: `interview.reminder.email:${ir.id}`, maxAttempts: 2 });
+    if (sub) await notifyOwners({ owners: [sub.created_by], type: 'interview.tomorrow', title: `Interview tomorrow: ${cand ? cand.name : 'candidate'} (${when})`, body: 'Confirm the candidate is prepared and the interviewer has the invite.', entity_type: 'submission', entity_id: sub.id, email: false });
+    return 'reminded';
+  };
+  const hooks = { afterPlacement: [], intakeApproved: null, bootstrap: null };
+  function registerWorkers(extra) { Object.assign(workers, extra); }
   let runner = null;
   function startJobRunner(intervalMs = 30000) {
     if (process.env.NODE_ENV === 'test' || runner) return;
     runner = setInterval(() => events.runJobs(workers).catch((e) => console.error('⚠️ job runner:', e.message)), intervalMs);
     if (runner.unref) runner.unref();
+    if (hooks.bootstrap) setTimeout(() => hooks.bootstrap(), 15000);
+  }
+  function buildIcs({ uid, start, minutes, summary, description, location, attendees }) {
+    const fmt = (d) => d.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+    const end = new Date(start.getTime() + minutes * 60000);
+    const escI = (t) => String(t || '').replace(/\\/g, '\\\\').replace(/;/g, '\\;').replace(/,/g, '\\,').replace(/\n/g, '\\n');
+    return ['BEGIN:VCALENDAR', 'VERSION:2.0', `PRODID:-//${COMPANY}//VelocityCRM//EN`, 'METHOD:REQUEST', 'BEGIN:VEVENT', `UID:${uid}`, `DTSTAMP:${fmt(new Date())}`, `DTSTART:${fmt(start)}`, `DTEND:${fmt(end)}`, `SUMMARY:${escI(summary)}`, `DESCRIPTION:${escI(description)}`, location ? `LOCATION:${escI(location)}` : null, `ORGANIZER;CN=${escI(COMPANY)}:mailto:${process.env.FROM_EMAIL || 'noreply@example.com'}`, ...attendees.map((a) => `ATTENDEE;ROLE=REQ-PARTICIPANT;RSVP=TRUE:mailto:${a}`), 'END:VEVENT', 'END:VCALENDAR'].filter(Boolean).join('\r\n');
+  }
+  async function scheduleInterviewComms(ir, { sendInvite = true } = {}) {
+    if (!ir.scheduled_at || ir.status === 'cancelled') return;
+    if (!ir.feedback_token) { const t = Events.token(18); await pool.query('UPDATE interview_rounds SET feedback_token=$1 WHERE id=$2', [t, ir.id]); ir.feedback_token = t; }
+    if (sendInvite) await events.enqueue('interview.invite', { interview_id: ir.id }, { dedupeKey: `interview.invite:${ir.id}:${new Date(ir.scheduled_at).getTime()}`, maxAttempts: 3 });
+    const remindAt = new Date(new Date(ir.scheduled_at).getTime() - 24 * 3600000);
+    await events.cancelJobs(`interview.reminder:${ir.id}`);
+    if (remindAt > new Date()) await events.enqueue('interview.reminder', { interview_id: ir.id }, { runAt: remindAt, dedupeKey: `interview.reminder:${ir.id}`, maxAttempts: 2 });
   }
 
   // ---------- Submission status transitions ----------
@@ -206,7 +266,20 @@ function install(deps) {
       await events.record({ type: 'submission.status_changed', entity_type: 'submission', entity_id: sub.id, actor: actorOf(req), payload: { from: st, to: 'hired', placement_id: placement.id } });
     }
     await events.record({ type: 'placement.created', entity_type: 'placement', entity_id: placement.id, actor: actorOf(req), payload: { submission_id: placement.submission_id, candidate_id: placement.candidate_id, job_order_id: placement.job_order_id, fee_amount: placement.fee_amount } });
+    for (const h of hooks.afterPlacement) { try { await h(placement); } catch (e) { console.error('⚠️ placement hook:', e.message); } }
   }
+  async function onPlacementUpdated(row, prev, req) {
+    const changed = ['start_date', 'end_date', 'placement_status', 'bill_rate', 'client_approver_email', 'consultant_email', 'timesheet_cycle'].filter((k) => String(prev[k] ?? '') !== String(row[k] ?? ''));
+    if (!changed.length) return;
+    await events.record({ type: 'placement.updated', entity_type: 'placement', entity_id: row.id, actor: actorOf(req), payload: Object.fromEntries(changed.map((k) => [k, { from: prev[k], to: row[k] }])) });
+    if (changed.includes('end_date') && prev.end_date && row.end_date && new Date(row.end_date) > new Date(prev.end_date)) {
+      await pool.query("UPDATE placements SET placement_status=CASE WHEN COALESCE(placement_status,'active')='active' THEN 'extended' ELSE placement_status END, initial_end_date=COALESCE(initial_end_date,$1) WHERE id::text=$2", [prev.end_date, String(row.id)]).catch(() => {});
+      await events.record({ type: 'placement.extended', entity_type: 'placement', entity_id: row.id, actor: actorOf(req), payload: { from: prev.end_date, to: row.end_date } });
+      await events.resolveOpen('placement.ending', 'placement', row.id, 'extended');
+    }
+    if (['start_date', 'end_date', 'placement_status', 'timesheet_cycle'].some((k) => changed.includes(k))) for (const h of hooks.afterPlacement) { try { await h(row); } catch (e) { console.error('⚠️ placement hook:', e.message); } }
+  }
+  const dedupeReview = (table, row) => dedupe.reviewRecord(pool, events, table, row).catch((e) => console.error('⚠️ duplicate review:', e.message));
 
   // ---------- Authorize Search ----------
   async function onLeadReadyToAuthorize(lead) {
@@ -403,6 +476,11 @@ function install(deps) {
     const rtr = sub.rtr_status === 'signed';
     if (!rtr && !body.override) { const e = new Error('No signed Right to Represent on file for this candidate and role. Send the RTR first, or pass override with a reason.'); e.status = 409; e.code = 'RTR_REQUIRED'; throw e; }
     if (!rtr) await events.record({ type: 'gate.override', entity_type: 'submission', entity_id: sub.id, actor: actorOf(req), payload: { gate: 'rtr', reason: body.override_reason || null } });
+    // NDA gate: no candidate details go to a client without a signed NDA on the account.
+    const gateJob = await loadJobOrder(sub.job_order_id); const gateAcct = await accountForJob(gateJob);
+    const ndaOk = !gateAcct || gateAcct.nda_status === 'signed' || process.env.NDA_GATE === 'off';
+    if (!ndaOk && !body.override) { const e = new Error(`No signed NDA on file for ${gateAcct.name}. Send the NDA first, or pass override with a reason.`); e.status = 409; e.code = 'NDA_REQUIRED'; e.account_id = String(gateAcct.id); throw e; }
+    if (!ndaOk) await events.record({ type: 'gate.override', entity_type: 'submission', entity_id: sub.id, actor: actorOf(req), payload: { gate: 'nda', account_id: String(gateAcct.id), reason: body.override_reason || null } });
     let profile = await latestProfile(sub.id);
     if (!profile) {
       if (!isProfileAIConfigured()) { const e = new Error('Generate the redacted candidate profile first (AI is not configured to generate it automatically).'); e.status = 409; e.code = 'PROFILE_REQUIRED'; throw e; }
@@ -508,9 +586,20 @@ function install(deps) {
   }
 
   // ================= ROUTES =================
-  const wrap = (fn) => async (req, res) => { try { await fn(req, res); } catch (err) { res.status(err.status || 500).json({ error: err.message, code: err.code, txn_id: err.txn_id }); } };
+  const wrap = (fn) => async (req, res) => { try { await fn(req, res); } catch (err) { res.status(err.status || 500).json({ error: err.message, code: err.code, txn_id: err.txn_id, account_id: err.account_id }); } };
   const publicHits = new Map();
-  const throttle = (key, limit = 60) => { const now = Date.now(); const h = publicHits.get(key) || { n: 0, at: now }; if (now - h.at > 3600000) { h.n = 0; h.at = now; } h.n += 1; publicHits.set(key, h); return h.n <= limit; };
+  const memThrottle = (key, limit) => { const now = Date.now(); const h = publicHits.get(key) || { n: 0, at: now }; if (now - h.at > 3600000) { h.n = 0; h.at = now; } h.n += 1; publicHits.set(key, h); return h.n <= limit; };
+  // Public-link throttle persisted in rate_limits (survives restarts and multiple instances); memory fallback.
+  const throttle = async (key, limit = 60) => {
+    try {
+      const now = new Date();
+      const cur = await one('SELECT * FROM rate_limits WHERE key=$1', [key]);
+      if (!cur) { await pool.query('INSERT INTO rate_limits (key, window_start, count) VALUES ($1,$2,1)', [key, now]); return true; }
+      if (now.getTime() - new Date(cur.window_start).getTime() > 3600000) { await pool.query('UPDATE rate_limits SET window_start=$1, count=1 WHERE key=$2', [now, key]); return true; }
+      await pool.query('UPDATE rate_limits SET count=count+1 WHERE key=$1', [key]);
+      return Number(cur.count) + 1 <= limit;
+    } catch { return memThrottle(key, limit); }
+  };
 
   // -- Authorize Search --
   app.post('/api/leads/:id/authorize-search', authenticateToken, wrap(async (req, res) => {
@@ -533,7 +622,7 @@ function install(deps) {
 
   // -- Client intake (public) --
   app.get('/api/intake/:token', wrap(async (req, res) => {
-    if (!throttle(`intake:${req.ip}`)) return res.status(429).json({ error: 'Too many requests' });
+    if (!(await throttle(`intake:${req.ip}`))) return res.status(429).json({ error: 'Too many requests' });
     const l = await intakeByToken(req.params.token);
     if (!l) return res.status(404).json({ error: 'This intake link is not valid' });
     const job = await loadJobOrder(l.job_order_id);
@@ -541,7 +630,7 @@ function install(deps) {
     res.json({ company: COMPANY, status: l.status, expires_at: l.expires_at, contact_name: lead ? lead.name : null, client_company: job ? job.company : null, job: jobPrefill(job), submitted: parse(l.submitted_data), fields: INTAKE_FIELDS });
   }));
   app.post('/api/intake/:token', wrap(async (req, res) => {
-    if (!throttle(`intake:${req.ip}`, 30)) return res.status(429).json({ error: 'Too many requests' });
+    if (!(await throttle(`intake:${req.ip}`, 30))) return res.status(429).json({ error: 'Too many requests' });
     const l = await intakeByToken(req.params.token);
     if (!l) return res.status(404).json({ error: 'This intake link is not valid' });
     if (l.status === 'expired') return res.status(410).json({ error: 'This intake link has expired. Ask your contact at ' + COMPANY + ' for a new one.' });
@@ -590,6 +679,7 @@ function install(deps) {
     if (!Object.keys(data).length) return res.status(409).json({ error: 'Nothing submitted yet on the intake link', code: 'NO_INTAKE' });
     const row = await applyIntakeToJob(job, data, { req, approvedBy: req.user.id });
     await pool.query("UPDATE intake_links SET status='approved', approved_at=CURRENT_TIMESTAMP, approved_by=$1 WHERE job_order_id=$2 AND status='submitted'", [String(req.user.id), String(job.id)]);
+    if (hooks.intakeApproved) { try { await hooks.intakeApproved(row, req); } catch (e) { console.error('⚠️ intake hook:', e.message); } }
     res.json({ ok: true, job_order: row });
   }));
   app.post('/api/job-orders/:id/intake/skip', authenticateToken, wrap(async (req, res) => {
@@ -633,13 +723,13 @@ function install(deps) {
 
   // -- Client review (public) --
   app.get('/api/client/:token', wrap(async (req, res) => {
-    if (!throttle(`client:${req.ip}`)) return res.status(429).json({ error: 'Too many requests' });
+    if (!(await throttle(`client:${req.ip}`))) return res.status(429).json({ error: 'Too many requests' });
     const l = await clientLinkByToken(req.params.token);
     if (!l) return res.status(404).json({ error: 'This review link is not valid' });
     res.json(await clientView(l));
   }));
   app.post('/api/client/:token/action', wrap(async (req, res) => {
-    if (!throttle(`client:${req.ip}`, 30)) return res.status(429).json({ error: 'Too many requests' });
+    if (!(await throttle(`client:${req.ip}`, 30))) return res.status(429).json({ error: 'Too many requests' });
     const l = await clientLinkByToken(req.params.token);
     if (!l) return res.status(404).json({ error: 'This review link is not valid' });
     if (l.status === 'expired') return res.status(410).json({ error: 'This review link has expired. Contact ' + COMPANY + ' for a new one.' });
@@ -653,28 +743,30 @@ function install(deps) {
     if (!sub) return res.status(404).json({ error: 'Submission not found' });
     const b = req.body || {};
     const n = await one('SELECT COALESCE(MAX(round),0)+1 AS r FROM interview_rounds WHERE submission_id=$1', [String(sub.id)]);
-    const ir = await one('INSERT INTO interview_rounds (submission_id, round, type, scheduled_at, interviewer, status, feedback, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *', [String(sub.id), b.round || Number(n.r), b.type || 'Interview', b.scheduled_at ? new Date(b.scheduled_at) : null, b.interviewer || null, b.scheduled_at ? 'scheduled' : 'requested', b.feedback || null, String(req.user.id)]);
+    const ir = await one('INSERT INTO interview_rounds (submission_id, round, type, scheduled_at, interviewer, interviewer_email, location, duration_minutes, status, feedback, created_by, feedback_token) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *', [String(sub.id), b.round || Number(n.r), b.type || 'Interview', b.scheduled_at ? new Date(b.scheduled_at) : null, b.interviewer || null, b.interviewer_email || null, b.location || null, b.duration_minutes ? Number(b.duration_minutes) : null, b.scheduled_at ? 'scheduled' : 'requested', b.feedback || null, String(req.user.id), Events.token(18)]);
     await events.record({ type: 'interview.created', entity_type: 'submission', entity_id: sub.id, actor: actorOf(req), payload: { round: ir.round, type: ir.type, scheduled_at: ir.scheduled_at } });
+    if (b.scheduled_at) await scheduleInterviewComms(ir, { sendInvite: b.send_invite !== false });
     const st = normalizeSubmissionStatus(sub.status);
     if (!OFFER_OR_LATER.includes(st)) await applySubmissionStatus(sub, b.scheduled_at ? 'interviewing' : 'interview_requested', { req, note: `Interview round ${ir.round} ${b.scheduled_at ? 'scheduled' : 'added'}` });
     if (b.scheduled_at) await pool.query('INSERT INTO activities (type, title, contact, candidate_id, status, due_at, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7)', ['Meeting', `Interview round ${ir.round} (${ir.type})`, b.interviewer || null, String(sub.candidate_id), 'pending', ir.scheduled_at, String(req.user.id)]).catch(() => {});
     res.status(201).json(ir);
   }));
-  app.put('/api/interviews/:id', authenticateToken, wrap(async (req, res) => {
-    const ir = await one('SELECT * FROM interview_rounds WHERE id=$1', [req.params.id]);
-    if (!ir) return res.status(404).json({ error: 'Interview not found' });
-    const b = req.body || {};
+  async function updateInterview(ir, b, { req = null, actor = null } = {}) {
     const sets = {};
-    for (const k of ['type', 'interviewer', 'feedback', 'status', 'outcome']) if (b[k] !== undefined) sets[k] = b[k];
+    for (const k of ['type', 'interviewer', 'interviewer_email', 'location', 'feedback', 'status', 'outcome', 'rating', 'recommendation']) if (b[k] !== undefined) sets[k] = b[k];
+    if (b.duration_minutes !== undefined) sets.duration_minutes = b.duration_minutes ? Number(b.duration_minutes) : null;
     if (b.scheduled_at !== undefined) { sets.scheduled_at = b.scheduled_at ? new Date(b.scheduled_at) : null; if (b.scheduled_at && !b.status && ir.status === 'requested') sets.status = 'scheduled'; }
     if (b.outcome && !b.status) sets.status = 'completed';
-    if (sets.status && !['requested', 'scheduled', 'completed', 'cancelled'].includes(sets.status)) return res.status(400).json({ error: 'status must be requested, scheduled, completed or cancelled' });
-    if (sets.outcome && !['advance', 'reject', 'offer', 'pending'].includes(sets.outcome)) return res.status(400).json({ error: 'outcome must be advance, reject, offer or pending' });
+    if (sets.status && !['requested', 'scheduled', 'completed', 'cancelled'].includes(sets.status)) { const e = new Error('status must be requested, scheduled, completed or cancelled'); e.status = 400; throw e; }
+    if (sets.outcome && !['advance', 'reject', 'offer', 'pending'].includes(sets.outcome)) { const e = new Error('outcome must be advance, reject, offer or pending'); e.status = 400; throw e; }
     const cols = Object.keys(sets);
-    if (!cols.length) return res.json(ir);
+    if (!cols.length) return ir;
     const q = await pool.query(`UPDATE interview_rounds SET ${cols.map((c, i) => `${c}=$${i + 1}`).join(', ')}, updated_at=CURRENT_TIMESTAMP WHERE id=$${cols.length + 1} RETURNING *`, [...cols.map((c) => sets[c]), ir.id]);
     const row = q.rows[0];
-    await events.record({ type: 'interview.updated', entity_type: 'submission', entity_id: ir.submission_id, actor: actorOf(req), payload: { round: ir.round, ...sets } });
+    await events.record({ type: 'interview.updated', entity_type: 'submission', entity_id: ir.submission_id, actor: actor || actorOf(req), payload: { round: ir.round, ...sets } });
+    const rescheduled = sets.scheduled_at && (!ir.scheduled_at || new Date(ir.scheduled_at).getTime() !== new Date(sets.scheduled_at).getTime());
+    if (row.scheduled_at && row.status === 'scheduled' && (rescheduled || (sets.interviewer_email && !ir.interviewer_email))) await scheduleInterviewComms(row, { sendInvite: b.send_invite !== false });
+    if (sets.status === 'cancelled') await events.cancelJobs(`interview.reminder:${ir.id}`);
     const sub = await loadSubmission(ir.submission_id);
     if (sub) {
       const st = normalizeSubmissionStatus(sub.status);
@@ -686,9 +778,37 @@ function install(deps) {
         if (!OFFER_OR_LATER.includes(st)) await applySubmissionStatus(sub, 'offer', { req, note: `Selected for offer after interview round ${ir.round}` });
         await notifyOwners({ owners: [sub.created_by], exclude: req.user.id, type: 'offer.prepare', title: `Prepare offer: ${cand ? cand.name : 'candidate'}`, body: `Interview round ${ir.round} outcome: offer. A draft offer was created.`, entity_type: 'submission', entity_id: sub.id });
       }
-      if (sets.outcome === 'advance') await notifyOwners({ owners: [sub.created_by], exclude: req.user.id, type: 'interview.advance', title: `Advance to next round`, body: `Interview round ${ir.round} passed. Schedule the next round or prepare an offer.`, entity_type: 'submission', entity_id: sub.id, email: false });
+      if (sets.outcome === 'advance') await notifyOwners({ owners: [sub.created_by], exclude: req ? req.user.id : null, type: 'interview.advance', title: `Advance to next round`, body: `Interview round ${ir.round} passed. Schedule the next round or prepare an offer.`, entity_type: 'submission', entity_id: sub.id, email: false });
     }
-    res.json(row);
+    return row;
+  }
+  app.put('/api/interviews/:id', authenticateToken, wrap(async (req, res) => {
+    const ir = await one('SELECT * FROM interview_rounds WHERE id=$1', [req.params.id]);
+    if (!ir) return res.status(404).json({ error: 'Interview not found' });
+    res.json(await updateInterview(ir, req.body || {}, { req }));
+  }));
+  // Interviewer feedback (public link from the invite email).
+  app.get('/api/feedback/:token', wrap(async (req, res) => {
+    if (!(await throttle(`feedback:${req.ip}`))) return res.status(429).json({ error: 'Too many requests' });
+    const ir = await one('SELECT * FROM interview_rounds WHERE feedback_token=$1', [String(req.params.token)]);
+    if (!ir) return res.status(404).json({ error: 'This feedback link is not valid' });
+    const sub = await loadSubmission(ir.submission_id); const cand = sub ? await loadCandidate(sub.candidate_id) : null; const job = sub ? await loadJobOrder(sub.job_order_id) : null;
+    res.json({ company: COMPANY, candidate: cand ? cand.name : 'Candidate', job_title: job ? job.title : null, round: ir.round, type: ir.type, scheduled_at: ir.scheduled_at, interviewer: ir.interviewer, submitted: !!ir.feedback_submitted_at, rating: ir.rating, recommendation: ir.recommendation });
+  }));
+  app.post('/api/feedback/:token', wrap(async (req, res) => {
+    if (!(await throttle(`feedback:${req.ip}`, 30))) return res.status(429).json({ error: 'Too many requests' });
+    const ir = await one('SELECT * FROM interview_rounds WHERE feedback_token=$1', [String(req.params.token)]);
+    if (!ir) return res.status(404).json({ error: 'This feedback link is not valid' });
+    if (ir.feedback_submitted_at) return res.status(409).json({ error: 'Feedback was already submitted for this round. Contact ' + COMPANY + ' to change it.' });
+    const b = req.body || {};
+    const rec = ['advance', 'reject', 'offer', 'undecided'].includes(b.recommendation) ? b.recommendation : 'undecided';
+    const rating = b.rating != null ? Math.max(1, Math.min(5, Number(b.rating))) : null;
+    const feedback = [b.name ? `Interviewer: ${b.name}` : '', rating ? `Rating: ${rating}/5` : '', `Recommendation: ${rec}`, b.comments || ''].filter(Boolean).join('\n');
+    const row = await updateInterview(ir, { feedback, rating, recommendation: rec, status: 'completed', ...(rec !== 'undecided' ? { outcome: rec } : {}) }, { actor: `interviewer:${b.name || ir.interviewer_email || 'link'}` });
+    await pool.query('UPDATE interview_rounds SET feedback_submitted_at=CURRENT_TIMESTAMP WHERE id=$1', [ir.id]);
+    const sub = await loadSubmission(ir.submission_id); const cand = sub ? await loadCandidate(sub.candidate_id) : null;
+    if (sub) await notifyOwners({ owners: [sub.created_by], type: 'interview.feedback', title: `Interview feedback: ${cand ? cand.name : 'candidate'} round ${ir.round} (${rec}${rating ? `, ${rating}/5` : ''})`, body: b.comments || 'No comments.', entity_type: 'submission', entity_id: sub.id });
+    res.json({ ok: true, recommendation: rec, rating, status: row.status });
   }));
 
   // -- Offers --
@@ -783,6 +903,35 @@ function install(deps) {
     res.json({ ok: true, matched: true });
   }));
 
+  // -- Duplicate review queue --
+  app.get('/api/duplicates', authenticateToken, wrap(async (req, res) => {
+    const q = await pool.query("SELECT * FROM exceptions WHERE kind='duplicate.review' AND status=$1 ORDER BY id DESC LIMIT 300", [req.query.status || 'open']);
+    res.json(q.rows.map((e) => ({ ...e, details: parse(e.details) })));
+  }));
+  app.post('/api/duplicates/:id/merge', authenticateToken, wrap(async (req, res) => {
+    const exc = await one('SELECT * FROM exceptions WHERE id=$1', [req.params.id]);
+    if (!exc) return res.status(404).json({ error: 'Not found' });
+    const d = parse(exc.details) || {}; const b = req.body || {};
+    const table = d.table || b.table;
+    const keep = b.keep_id, remove = b.remove_id;
+    if (!table || keep == null || remove == null) return res.status(400).json({ error: 'keep_id and remove_id are required' });
+    const r = await dedupe.mergeRecords(pool, events, table, keep, remove, { actor: actorOf(req) });
+    await events.resolveException(exc.id, { by: req.user.id, resolution: `merged ${remove} into ${keep}` });
+    res.json(r);
+  }));
+  app.post('/api/duplicates/:id/dismiss', authenticateToken, wrap(async (req, res) => {
+    const exc = await one('SELECT * FROM exceptions WHERE id=$1', [req.params.id]);
+    if (!exc) return res.status(404).json({ error: 'Not found' });
+    const d = parse(exc.details) || {};
+    for (const m of d.matches || []) await dedupe.dismissPair(pool, events, d.table, d.record.id, m.id, { actor: actorOf(req) });
+    res.json(await events.resolveException(exc.id, { by: req.user.id, resolution: 'not a duplicate' }));
+  }));
+  app.post('/api/duplicates/scan', authenticateToken, requireAdmin, wrap(async (req, res) => {
+    const tables = (req.body && req.body.tables) || ['candidates', 'contacts', 'accounts', 'leads'];
+    const out = {}; for (const t of tables) if (dedupe.ENTITY[t]) out[t] = await dedupe.scanTable(pool, events, t);
+    res.json(out);
+  }));
+
   // -- Notifications --
   app.get('/api/notifications', authenticateToken, wrap(async (req, res) => {
     const uid = String(req.user.id);
@@ -843,13 +992,18 @@ function install(deps) {
       submissions_with_client: await n("SELECT COUNT(*) AS n FROM submissions WHERE status='client_review'"),
       offers_open: await n("SELECT COUNT(*) AS n FROM offers WHERE status IN ('draft','extended')"),
       signatures_pending: await n("SELECT COUNT(*) AS n FROM signature_requests WHERE status IN ('sent','viewed')"),
+      duplicates_to_review: await n("SELECT COUNT(*) AS n FROM exceptions WHERE kind='duplicate.review' AND status='open'"),
+      sla_breaches: await n("SELECT COUNT(*) AS n FROM exceptions WHERE kind LIKE 'sla.%' AND status='open'"),
+      timesheets_open: await n("SELECT COUNT(*) AS n FROM timesheets WHERE status IN ('open','submitted')").catch(() => 0),
+      invoices_unpaid: await n("SELECT COUNT(*) AS n FROM invoices WHERE status IN ('draft','created','sent')").catch(() => 0),
+      outreach_awaiting: await n("SELECT COUNT(*) AS n FROM candidate_outreach WHERE status='sent'").catch(() => 0),
       events_24h: await n('SELECT COUNT(*) AS n FROM events WHERE created_at > $1', [new Date(Date.now() - 86400000)]),
       esign: { configured: esign.isConfigured(), provider: esign.providerName() },
       email_configured: isEmailConfigured(),
     });
   }));
 
-  return { events, ensureSchema, notify, workers, startJobRunner, applySubmissionStatus, placementGate, afterPlacement, onLeadReadyToAuthorize, authorizeSearch, normalizeSubmissionStatus, audit };
+  return { events, ensureSchema, notify, notifyOwners, workers, registerWorkers, hooks, startJobRunner, applySubmissionStatus, placementGate, afterPlacement, onPlacementUpdated, onLeadReadyToAuthorize, authorizeSearch, normalizeSubmissionStatus, audit, createSignatureRequest, sendSignatureRequest, throttle, dedupeReview, loadJobOrder, accountForJob, scheduleInterviewComms };
 }
 
 module.exports = { install, SUBMISSION_STATUSES, STATUS_IDS, normalizeSubmissionStatus, INTERVIEW_OR_LATER, OFFER_OR_LATER, ACCEPTED_OR_LATER, PLACEMENT_READY, INTAKE_FIELDS, CLIENT_ACTIONS, SCHEMA };

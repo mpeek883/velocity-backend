@@ -542,7 +542,7 @@ const LEAD_COLS       = ['name', 'title', 'company', 'company_address', 'company
                          'end_client', 'employment_type', 'work_arrangement', 'workflow_status', 'email_subject', 'email_from', 'email_body', 'email_received_at'];
 const OPP_COLS        = ['name', 'account', 'contact', 'contact_email', 'value', 'stage', 'probability', 'close_date', 'type', 'competitor', 'notes', 'forecast_category', 'win_loss_reason',
                          'job_title', 'job_description', 'client_name', 'rate', 'work_location', 'work_arrangement', 'lead_id', 'account_id'];
-const PLACEMENT_COLS  = ['submission_id', 'candidate_id', 'job_order_id', 'start_date', 'end_date', 'fee_amount', 'placement_status', 'created_by', 'initial_end_date'];
+const PLACEMENT_COLS  = ['submission_id', 'candidate_id', 'job_order_id', 'start_date', 'end_date', 'fee_amount', 'placement_status', 'created_by', 'initial_end_date', 'bill_rate', 'bill_rate_type', 'client_approver_email', 'consultant_email', 'timesheet_cycle'];
 const ACTIVITY_COLS   = ['type', 'title', 'contact', 'account', 'due_at', 'status', 'duration', 'notes', 'lead_id', 'opportunity_id', 'account_id', 'contact_id', 'candidate_id'];
 
 // ====== MIDDLEWARE ======
@@ -785,7 +785,9 @@ app.post('/api/contacts', authenticateToken, async (req, res) => {
     const body = { contact_type: 'Company', ...(req.body || {}) };
     if (Array.isArray(body.skills)) body.skills = contactsSync.skillsToText(body.skills);
     const dup = await checkDuplicate('contacts', body); if (dup) return sendDuplicate(res, 'contacts', dup);
-    res.status(201).json(await insertRow('contacts', CONTACT_COLS, body));
+    const row = await insertRow('contacts', CONTACT_COLS, body);
+    auto.dedupeReview('contacts', row);
+    res.status(201).json(row);
   } catch (err) {
     sendDbError(res, err);
   }
@@ -833,6 +835,7 @@ app.post('/api/accounts', authenticateToken, async (req, res) => {
     if (!req.body || !req.body.name) return res.status(400).json({ error: 'name is required' });
     const dup = await checkDuplicate('accounts', req.body); if (dup) return sendDuplicate(res, 'accounts', dup);
     const row = await insertRow('accounts', ACCOUNT_COLS, req.body);
+    auto.dedupeReview('accounts', row);
     res.status(201).json((await assignRecordNumber('accounts', row.id)) || row);
   } catch (err) {
     sendDbError(res, err);
@@ -872,6 +875,7 @@ app.post('/api/candidates', authenticateToken, async (req, res) => {
     const dup = await checkDuplicate('candidates', req.body); if (dup) return sendDuplicate(res, 'candidates', dup);
     const row = await insertRow('candidates', CANDIDATE_COLS, req.body);
     contactsSync.syncContactFromCandidate(pool, row).catch((e) => console.error('⚠️ Contact sync (candidate) failed:', e.message));
+    auto.dedupeReview('candidates', row);
     res.status(201).json(row);
   } catch (err) {
     sendDbError(res, err);
@@ -1169,6 +1173,7 @@ async function afterLeadCreated(row, { assignTo } = {}) {
   try { const a = await leadAssignment.assignLead(pool, lead, assignTo || null); if (a.lead) lead = a.lead; } catch (e) { console.error('⚠️ Lead assignment failed:', e.message); }
   try { await contactsSync.syncContactFromLead(pool, lead); } catch (e) { console.error('⚠️ Contact sync (lead) failed:', e.message); }
   auto.events.record({ type: 'lead.created', entity_type: 'lead', entity_id: lead.id, actor: lead.origin === 'system' ? 'lead-scanner' : 'user', payload: { lead_no: lead.lead_no, source: lead.source, assigned_to: lead.assigned_to } });
+  auto.dedupeReview('leads', lead);
   return lead;
 }
 leadScanner.onLeadCreated = (row) => afterLeadCreated(row);
@@ -2196,8 +2201,11 @@ app.get('/api/staffing/dashboard', authenticateToken, async (req, res) => {
 
 app.put('/api/placements/:id', authenticateToken, async (req, res) => {
   try {
+    const prev = (await pool.query('SELECT * FROM placements WHERE id::text=$1', [String(req.params.id)])).rows[0];
+    if (!prev) return res.status(404).json({ error: 'Placement not found' });
     const row = await updateRow('placements', PLACEMENT_COLS, req.params.id, req.body);
     if (!row) return res.status(404).json({ error: 'Placement not found' });
+    auto.onPlacementUpdated(row, prev, req).catch((e) => console.error('⚠️ placement update hook:', e.message));
     res.json(row);
   } catch (err) {
     sendDbError(res, err);
@@ -2330,6 +2338,17 @@ auto = automation.install({
 });
 // Users & roles changes must clear the cached role.
 app.use('/api/users', (req, res, next) => { if (!['GET', 'HEAD'].includes(req.method)) roleGuard.roles.clear(); next(); });
+app.get('/api/roles/matrix', authenticateToken, (req, res) => res.json({ matrix: roles.MATRIX, ownership: process.env.OWNERSHIP_MODE !== 'off', nda_gate: process.env.NDA_GATE !== 'off' }));
+// SLA watchdog, weekly digest, maintenance, post-placement cadence
+const watchdog = require('./watchdog').install({ pool, events: auto.events, notify: auto.notify, notifyOwners: auto.notifyOwners, sendEmail, isEmailConfigured, matching, roleCache: roleGuard.roles, jwt, jwtSecret: JWT_SECRET, port: PORT, app, authenticateToken, requireAdmin });
+// Candidate outreach from AI matches
+const outreach = require('./outreach').install({ app, pool, events: auto.events, authenticateToken, notifyOwners: auto.notifyOwners, runMatch, createSignatureRequest: auto.createSignatureRequest, sendSignatureRequest: auto.sendSignatureRequest, normalizeSubmissionStatus: automation.normalizeSubmissionStatus, throttle: auto.throttle });
+// Timesheets, approvals, invoices, QuickBooks
+const timesheets = require('./timesheets').install({ app, pool, events: auto.events, authenticateToken, requireAdmin, notifyOwners: auto.notifyOwners, sendEmail, isEmailConfigured, throttle: auto.throttle, jwt, jwtSecret: JWT_SECRET });
+auto.registerWorkers({ ...watchdog.workers, ...outreach.workers, ...timesheets.workers });
+auto.hooks.afterPlacement.push(watchdog.schedulePlacementJobs, timesheets.schedulePlacement);
+auto.hooks.intakeApproved = (job, req) => auto.events.enqueue('outreach.suggest', { job_order_id: job.id, created_by: req.user.id }, { dedupeKey: `outreach.suggest:${job.id}`, maxAttempts: 2 });
+auto.hooks.bootstrap = watchdog.bootstrap;
 
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
