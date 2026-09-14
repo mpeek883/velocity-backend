@@ -1329,7 +1329,12 @@ app.get('/api/leads/scan/status', authenticateToken, async (req, res) => {
   try {
     const counts = await pool.query("SELECT COUNT(*) AS scanned, SUM(CASE WHEN classification='recruiter_lead' THEN 1 ELSE 0 END) AS leads FROM email_scan_log");
     const connected = await mailOAuth.connectedMailboxes(pool).catch(() => []);
+    // Per-mailbox health: how many leads each inbox has produced and when the newest one arrived.
+    const byBox = await pool.query("SELECT COALESCE(mailbox, CASE WHEN origin='system' THEN '(unknown mailbox)' ELSE 'manual' END) AS mailbox, COUNT(*) AS leads, MAX(email_received_at) AS last_email_at, MAX(created_at) AS last_lead_at, SUM(CASE WHEN created_at > $1 THEN 1 ELSE 0 END) AS leads_7d FROM leads GROUP BY 1 ORDER BY 2 DESC", [new Date(Date.now() - 7 * 86400000)]).catch(() => ({ rows: [] }));
+    const scannedByBox = await pool.query('SELECT mailbox, COUNT(*) AS scanned, MAX(scanned_at) AS last_scanned_at FROM email_scan_log GROUP BY mailbox').catch(() => ({ rows: [] }));
+    const scanMap = new Map(scannedByBox.rows.map((r) => [String(r.mailbox || '').toLowerCase(), r]));
     res.json({
+      leads_by_mailbox: byBox.rows.map((r) => ({ mailbox: r.mailbox, leads: Number(r.leads), leads_7d: Number(r.leads_7d), last_email_at: r.last_email_at, last_lead_at: r.last_lead_at, messages_scanned: scanMap.get(String(r.mailbox).toLowerCase()) ? Number(scanMap.get(String(r.mailbox).toLowerCase()).scanned) : null })),
       mailboxes: [...leadScanner.publicMailboxes(), ...connected.map((b) => ({ address: b.address, provider: b.provider, host: null, last_scanned_at: b.connection.last_scanned_at }))],
       ai_configured: leadScanner.isLeadAIConfigured(),
       scan_interval_minutes: LEAD_SCAN_INTERVAL_MIN,
