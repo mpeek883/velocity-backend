@@ -153,11 +153,11 @@ async function analyzeInboundReply(lead, msg, options = {}) {
 const NUDGE_DAYS = String(process.env.LEAD_NUDGE_DAYS === undefined ? '1,2' : process.env.LEAD_NUDGE_DAYS).split(',').map((x) => Number(x.trim())).filter((n) => n > 0);
 function nudgeEmail(lead, n, missing = []) {
   const first = leadFirstName(lead);
-  const role = lead.job_title ? `the ${lead.job_title} role` : 'the role you wrote about';
-  const ask = missing.length ? ` If it helps, the ${missing.length === 1 ? 'one detail' : 'details'} I still need ${missing.length === 1 ? 'is' : 'are'} ${missing.map((m) => (ASK_LABEL[m.key] || m.label).toLowerCase()).join(', ').replace(/, ([^,]*)$/, ' and $1')}.` : '';
+  const role = lead.job_title ? `your ${lead.job_title} search` : 'your search';
+  const need = missing.length ? missing.map((m) => (ASK_LABEL[m.key] || m.label).toLowerCase().replace(/^the /, '')).join(', ').replace(/, ([^,]*)$/, ' and $1') : '';
   const body = n === 1
-    ? `Hi ${first},\n\nI wanted to make sure my note below didn't get buried.\n\nShort version: I'm not personally available for ${role}, but Peek Talent Solutions can source a qualified resource for you from our network of ${NETWORK_SIZE} professionals. A quick "yes" and we start today; a quick "no" and I'll close my file.${ask}\n\nThanks, ${first}.`
-    : `Hi ${first},\n\nThis is my last check-in before I close this out on my side.\n\nIf you'd like Peek Talent Solutions to help fill ${role}, just reply "yes" and we'll begin sourcing right away.${ask} If it's already filled or not a fit, a "no" is perfectly fine and I'll stop following up.\n\nEither way, thank you for thinking of me.`;
+    ? `Hi ${first},\n\nHope your week is going well. I know recruiter inboxes fill up fast, so I just wanted to float my note back to the top.\n\nIf ${role} is still open, I'd be glad to start lining up a few strong people for you. All I need is a quick "yes" to get moving${need ? `, plus the ${need} so I can aim the search properly` : ''}.\n\nAnd if it's already filled or the timing isn't right, no worries at all, a quick "no" is just as helpful.\n\nThanks, ${first}.`
+    : `Hi ${first},\n\nOne last friendly check-in from me, and then I'll get out of your inbox.\n\nIf you'd still like a hand with ${role}, reply with a "yes" and I'll start sending you candidates this week${need ? ` (the ${need} would help me aim the search)` : ''}. If it has closed out on your side, just let me know and I'll wish you luck with it.\n\nEither way, I appreciate you thinking of me, and I hope our paths cross on the next one.\n\nBest, ${first} - talk soon.`;
   return { subject: replySubject(lead), body };
 }
 function closeOutEmail(lead) {
