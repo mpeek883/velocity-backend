@@ -1542,6 +1542,7 @@ app.post('/api/leads/:id/reply', authenticateToken, async (req, res) => {
       extra: { missing_info: JSON.stringify(missing.map((m) => m.key)) },
     });
     auto.audit('lead.replied', 'lead', lead.id, req, { transport: result.transport, status: result.lead && result.lead.workflow_status });
+    scheduleLeadNudges(result.lead || lead).catch((e) => console.error('⚠️ nudge scheduling:', e.message));
     res.json({ ok: true, transport: result.transport, lead: result.lead, missing });
   } catch (err) {
     res.status(err.status || 502).json({ error: err.message, code: err.code });
@@ -2357,6 +2358,30 @@ auto.registerWorkers({ ...watchdog.workers, ...outreach.workers, ...timesheets.w
 auto.hooks.afterPlacement.push(watchdog.schedulePlacementJobs, timesheets.schedulePlacement);
 auto.hooks.intakeApproved = (job, req) => auto.events.enqueue('outreach.suggest', { job_order_id: job.id, created_by: req.user.id }, { dedupeKey: `outreach.suggest:${job.id}`, maxAttempts: 2 });
 auto.hooks.bootstrap = watchdog.bootstrap;
+// Follow-up nudges: business days 1 and 2 after the offer reply (close-out is day 3), cancelled the moment the recruiter answers.
+async function scheduleLeadNudges(lead) {
+  const from = lead.replied_at ? new Date(lead.replied_at) : new Date();
+  for (const n of leadWorkflow.NUDGE_DAYS) {
+    if (n >= leadWorkflow.FOLLOW_UP_BUSINESS_DAYS) continue; // never after the close-out
+    await auto.events.enqueue('lead.nudge', { lead_id: String(lead.id), n }, { runAt: leadWorkflow.addBusinessDays(from, n), dedupeKey: `lead.nudge:${lead.id}:${n}`, maxAttempts: 3 });
+  }
+}
+async function cancelLeadNudges(leadId) { for (const n of leadWorkflow.NUDGE_DAYS) await auto.events.cancelJobs(`lead.nudge:${leadId}:${n}`); }
+leadWorkflow.onInbound = (lead) => cancelLeadNudges(lead.id);
+auto.registerWorkers({
+  'lead.nudge': async ({ lead_id, n }) => {
+    const lead = await loadLead(lead_id);
+    if (!lead) return 'gone';
+    if (!['replied', 'awaiting_info'].includes(lead.workflow_status)) return `skip: ${lead.workflow_status}`;
+    if (lead.last_inbound_at && lead.replied_at && new Date(lead.last_inbound_at) > new Date(lead.replied_at)) return 'skip: they answered';
+    const already = await pool.query("SELECT COUNT(*) AS c FROM lead_emails WHERE lead_id=$1 AND kind='nudge'", [String(lead.id)]);
+    if (Number(already.rows[0].c) >= n) return 'skip: already sent';
+    const mail = leadWorkflow.nudgeEmail(lead, n, leadWorkflow.missingInfo(lead));
+    await leadWorkflow.sendLeadEmail(pool, lead, { kind: 'nudge', ...mail, status: lead.workflow_status, extra: { follow_up_due_at: lead.follow_up_due_at } });
+    await auto.events.record({ type: 'lead.nudged', entity_type: 'lead', entity_id: lead.id, payload: { n } });
+    return `nudge ${n} sent`;
+  },
+});
 // Reply as myself (admin): personal interest reply + tailored resume attachment
 const personal = require('./personal-reply').install({ app, pool, authenticateToken, requireAdmin, sendEmail, textToHtml, leadWorkflow, events: auto.events, extractText, resumeUpload, notifyOwners: auto.notifyOwners });
 leadWorkflow.onPersonalInbound = personal.onPersonalInbound;

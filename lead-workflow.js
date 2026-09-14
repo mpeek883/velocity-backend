@@ -147,6 +147,19 @@ async function analyzeInboundReply(lead, msg, options = {}) {
   return response.parsed_output;
 }
 
+// Follow-up nudges between the offer reply and the close-out: a short, friendly
+// push for a yes or a no. LEAD_NUDGE_DAYS lists the business days after the
+// reply on which to send them (default 1 and 2; the close-out is day 3).
+const NUDGE_DAYS = String(process.env.LEAD_NUDGE_DAYS === undefined ? '1,2' : process.env.LEAD_NUDGE_DAYS).split(',').map((x) => Number(x.trim())).filter((n) => n > 0);
+function nudgeEmail(lead, n, missing = []) {
+  const first = leadFirstName(lead);
+  const role = lead.job_title ? `the ${lead.job_title} role` : 'the role you wrote about';
+  const ask = missing.length ? ` If it helps, the ${missing.length === 1 ? 'one detail' : 'details'} I still need ${missing.length === 1 ? 'is' : 'are'} ${missing.map((m) => (ASK_LABEL[m.key] || m.label).toLowerCase()).join(', ').replace(/, ([^,]*)$/, ' and $1')}.` : '';
+  const body = n === 1
+    ? `Hi ${first},\n\nI wanted to make sure my note below didn't get buried.\n\nShort version: I'm not personally available for ${role}, but Peek Talent Solutions can source a qualified resource for you from our network of ${NETWORK_SIZE} professionals. A quick "yes" and we start today; a quick "no" and I'll close my file.${ask}\n\nThanks, ${first}.`
+    : `Hi ${first},\n\nThis is my last check-in before I close this out on my side.\n\nIf you'd like Peek Talent Solutions to help fill ${role}, just reply "yes" and we'll begin sourcing right away.${ask} If it's already filled or not a fit, a "no" is perfectly fine and I'll stop following up.\n\nEither way, thank you for thinking of me.`;
+  return { subject: replySubject(lead), body };
+}
 function closeOutEmail(lead) {
   const first = leadFirstName(lead);
   return {
@@ -248,6 +261,7 @@ async function createOpportunityFromLead(pool, lead, analysis = {}) {
  * Returns { action, lead, opportunity? }.
  */
 async function handleInboundReply(pool, lead, msg, options = {}) {
+  if (module.exports.onInbound) { try { await module.exports.onInbound(lead, msg); } catch (e) { console.error('⚠️ inbound hook:', e.message); } }
   if (lead.workflow_status === 'personal_interest') {
     // Brad applied for this role himself: log the reply, tell him, and never auto-answer.
     await logEmail(pool, lead, { direction: 'inbound', kind: 'reply', subject: msg.subject, body: String(msg.text || '').slice(0, 20000), message_id: msg.message_id, from_email: msg.from_email });
@@ -324,5 +338,5 @@ async function processFollowUps(pool, options = {}) {
 module.exports = {
   CRITICAL_FIELDS, missingInfo, addBusinessDays, draftOfferReply, templateOfferReply, analyzeInboundReply,
   closeOutEmail, followUpRequestEmail, sendLeadEmail, handleInboundReply, processFollowUps, createOpportunityFromLead,
-  logEmail, setLead, isAIConfigured, FOLLOW_UP_BUSINESS_DAYS, _setClientForTests, findOrCreateAccount, SIGNATURE, LEAD_BCC, replySubject,
+  logEmail, setLead, isAIConfigured, FOLLOW_UP_BUSINESS_DAYS, _setClientForTests, findOrCreateAccount, SIGNATURE, LEAD_BCC, replySubject, nudgeEmail, NUDGE_DAYS,
 };
