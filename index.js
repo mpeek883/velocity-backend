@@ -15,6 +15,7 @@ const { buildCandidateProfile, markdownToHtml, isProfileAIConfigured } = require
 const leadScanner = require('./lead-scanner');
 const leadWorkflow = require('./lead-workflow');
 const contactsSync = require('./contacts-sync');
+const mailOAuth = require('./mail-oauth');
 const leadAssignment = require('./lead-assignment');
 const matching = require('./matching');
 
@@ -274,6 +275,22 @@ async function ensureSchema() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`,
+    `CREATE TABLE IF NOT EXISTS mail_connections (
+      id SERIAL PRIMARY KEY,
+      provider VARCHAR(20) NOT NULL,
+      address VARCHAR(255) NOT NULL,
+      refresh_token TEXT,
+      access_token TEXT,
+      expires_at TIMESTAMP,
+      scopes TEXT,
+      connected_by TEXT,
+      status VARCHAR(20) DEFAULT 'connected',
+      last_error TEXT,
+      last_scanned_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (provider, address)
+    )`,
     `CREATE TABLE IF NOT EXISTS candidate_matches (
       id SERIAL PRIMARY KEY,
       target_kind VARCHAR(20),
@@ -322,6 +339,8 @@ async function ensureSchema() {
     "UPDATE leads SET origin='system' WHERE origin IS NULL AND message_id IS NOT NULL",
     "UPDATE leads SET origin='manual' WHERE origin IS NULL",
     "UPDATE contacts SET contact_type='Company' WHERE contact_type IS NULL",
+    // The first user of a database is the admin until roles are assigned.
+    "UPDATE users SET role='admin' WHERE role IS NULL AND id = (SELECT MIN(id) FROM users)",
   ];
   let failures = 0;
   for (const sql of statements) {
@@ -371,6 +390,54 @@ function pickColumns(body, allowed) {
     }
   }
   return { cols, vals };
+}
+
+// ---- Duplicate prevention ----
+// Before a manual create, look for an existing record that is clearly the
+// same thing (same email; same name + company/phone; same account or job
+// title still open). A match answers 409 DUPLICATE with the existing record
+// unless the caller sends allow_duplicate: true.
+const norm = (v) => String(v || '').trim().toLowerCase();
+async function checkDuplicate(table, b) {
+  if (!b || b.allow_duplicate) return null;
+  const email = norm(b.email), name = norm(b.name), company = norm(b.company), digits = String(b.phone || '').replace(/\D/g, '');
+  const site = (v) => norm(v).replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/.*$/, '');
+  let rows = [], test = () => null;
+  if (table === 'contacts' || table === 'leads' || table === 'candidates') {
+    if (!email && !name) return null;
+    rows = (await pool.query(`SELECT * FROM ${table} WHERE LOWER(COALESCE(email,''))=$1 OR LOWER(COALESCE(name,''))=$2`, [email || '-', name || '-'])).rows;
+    test = (r) => {
+      if (email && norm(r.email) === email) return 'same email';
+      if (name && norm(r.name) === name) {
+        if (company && norm(r.company) === company) return 'same name and company';
+        if (digits && String(r.phone || '').replace(/\D/g, '') === digits) return 'same name and phone';
+      }
+      return null;
+    };
+  } else if (table === 'accounts') {
+    const w = site(b.website); if (!name && !w) return null;
+    rows = (await pool.query('SELECT * FROM accounts')).rows;
+    test = (r) => (name && norm(r.name) === name) ? 'same company name' : (w && site(r.website) === w) ? 'same website' : null;
+  } else if (table === 'opportunities') {
+    const account = norm(b.account); if (!name) return null;
+    rows = (await pool.query('SELECT * FROM opportunities WHERE LOWER(COALESCE(name,\'\'))=$1', [name])).rows;
+    test = (r) => norm(r.account) === account && !['closed won', 'closed lost'].includes(norm(r.stage)) ? 'same deal name and account, still open' : null;
+  } else if (table === 'job_orders') {
+    const title = norm(b.title), comp = norm(b.company); if (!title) return null;
+    rows = (await pool.query('SELECT * FROM job_orders WHERE LOWER(COALESCE(title,\'\'))=$1', [title])).rows;
+    test = (r) => norm(r.company) === comp && !['closed', 'filled', 'cancelled'].includes(norm(r.status)) ? 'same title and company, still open' : null;
+  }
+  for (const r of rows) { const reason = test(r); if (reason) return { existing: r, reason }; }
+  return null;
+}
+function sendDuplicate(res, table, dup) {
+  const label = { contacts: 'contact', accounts: 'account', leads: 'lead', candidates: 'candidate', opportunities: 'opportunity', job_orders: 'job order' }[table] || 'record';
+  const e = dup.existing;
+  res.status(409).json({
+    code: 'DUPLICATE',
+    error: `Looks like a duplicate ${label}: "${e.name || e.title}" already exists (${dup.reason}). Edit the existing record instead.`,
+    existing: { id: e.id, name: e.name || e.title, email: e.email, company: e.company || e.account || null },
+  });
 }
 
 async function insertRow(table, allowed, body) {
@@ -631,8 +698,9 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
+    if (user.is_active === false) return res.status(403).json({ error: 'This account is deactivated' });
     const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '24h' });
-    res.json({ token, user: { id: user.id, email: user.email, name: user.name } });
+    res.json({ token, user: { id: user.id, email: user.email, name: user.name, role: user.role || (user.id === 1 ? 'admin' : 'recruiter') } });
   } catch (err) {
     console.error('Login error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -654,6 +722,7 @@ app.post('/api/contacts', authenticateToken, async (req, res) => {
   try {
     const body = { contact_type: 'Company', ...(req.body || {}) };
     if (Array.isArray(body.skills)) body.skills = contactsSync.skillsToText(body.skills);
+    const dup = await checkDuplicate('contacts', body); if (dup) return sendDuplicate(res, 'contacts', dup);
     res.status(201).json(await insertRow('contacts', CONTACT_COLS, body));
   } catch (err) {
     sendDbError(res, err);
@@ -700,6 +769,7 @@ const ACCOUNT_COLS = ['name', 'industry', 'size', 'website', 'billing_contact', 
 app.post('/api/accounts', authenticateToken, async (req, res) => {
   try {
     if (!req.body || !req.body.name) return res.status(400).json({ error: 'name is required' });
+    const dup = await checkDuplicate('accounts', req.body); if (dup) return sendDuplicate(res, 'accounts', dup);
     const row = await insertRow('accounts', ACCOUNT_COLS, req.body);
     res.status(201).json((await assignRecordNumber('accounts', row.id)) || row);
   } catch (err) {
@@ -737,6 +807,7 @@ app.get('/api/candidates', authenticateToken, async (req, res) => {
 
 app.post('/api/candidates', authenticateToken, async (req, res) => {
   try {
+    const dup = await checkDuplicate('candidates', req.body); if (dup) return sendDuplicate(res, 'candidates', dup);
     const row = await insertRow('candidates', CANDIDATE_COLS, req.body);
     contactsSync.syncContactFromCandidate(pool, row).catch((e) => console.error('⚠️ Contact sync (candidate) failed:', e.message));
     res.status(201).json(row);
@@ -816,6 +887,7 @@ app.get('/api/job-orders', authenticateToken, async (req, res) => {
 
 app.post('/api/job-orders', authenticateToken, async (req, res) => {
   try {
+    const dup = await checkDuplicate('job_orders', req.body); if (dup) return sendDuplicate(res, 'job_orders', dup);
     res.status(201).json(await insertRow('job_orders', JOB_ORDER_COLS, req.body));
   } catch (err) {
     sendDbError(res, err);
@@ -1035,6 +1107,7 @@ leadWorkflow.onLeadUpdated = (row) => contactsSync.syncContactFromLead(pool, row
 app.post('/api/leads', authenticateToken, async (req, res) => {
   try {
     const { assigned_to, ...body } = req.body || {};
+    const dup = await checkDuplicate('leads', body); if (dup) return sendDuplicate(res, 'leads', dup);
     const row = await insertRow('leads', LEAD_COLS, body);
     res.status(201).json(await afterLeadCreated(row, { assignTo: assigned_to }));
   } catch (err) { sendDbError(res, err); }
@@ -1053,15 +1126,75 @@ app.put('/api/leads/:id', authenticateToken, async (req, res) => {
   } catch (err) { sendDbError(res, err); }
 });
 
-// Team + assignment
+// Team + assignment + user administration
+const ROLES = ['admin', 'recruiter', 'sales', 'viewer'];
+// Admin check: the caller's stored role must be admin. If no admin exists yet
+// (fresh database), the first user is treated as admin.
+async function requireAdmin(req, res, next) {
+  try {
+    const me = await pool.query('SELECT id, role FROM users WHERE id::text=$1', [String(req.user.id)]);
+    const admins = await pool.query("SELECT COUNT(*) AS n FROM users WHERE role='admin'");
+    const isAdmin = me.rows.length && (me.rows[0].role === 'admin' || (Number(admins.rows[0].n) === 0));
+    if (!isAdmin) return res.status(403).json({ error: 'Only an admin can manage users' });
+    next();
+  } catch (err) { res.status(500).json({ error: err.message }); }
+}
+function tempPassword() {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
+  let s = ''; for (const b of require('crypto').randomBytes(12)) s += alphabet[b % alphabet.length];
+  return `${s.slice(0, 4)}-${s.slice(4, 8)}-${s.slice(8, 12)}`;
+}
 app.get('/api/users', authenticateToken, async (req, res) => {
   try { res.json(await leadAssignment.listTeam(pool)); } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.post('/api/users', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { email, name, role = 'recruiter', takes_leads = true, password } = req.body || {};
+    if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'A valid email is required' });
+    if (!ROLES.includes(role)) return res.status(400).json({ error: `Role must be one of ${ROLES.join(', ')}` });
+    const dup = await pool.query('SELECT id FROM users WHERE LOWER(email)=LOWER($1)', [email]);
+    if (dup.rows.length) return res.status(409).json({ error: 'A user with that email already exists' });
+    const plain = password && String(password).length >= 8 ? String(password) : tempPassword();
+    const hash = await bcrypt.hash(plain, 10);
+    const q = await pool.query(
+      'INSERT INTO users (email, password_hash, name, role, is_active, takes_leads) VALUES ($1,$2,$3,$4,TRUE,$5) RETURNING id, email, name, role, is_active, takes_leads, created_at',
+      [email.toLowerCase(), hash, name || email.split('@')[0], role, takes_leads !== false]);
+    // The temporary password is returned exactly once so it can be handed to the new user.
+    res.status(201).json({ ...q.rows[0], temporary_password: password ? undefined : plain });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.post('/api/users/:id/password', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const plain = req.body && req.body.password && String(req.body.password).length >= 8 ? String(req.body.password) : tempPassword();
+    const hash = await bcrypt.hash(plain, 10);
+    const q = await pool.query('UPDATE users SET password_hash=$1 WHERE id::text=$2 RETURNING id, email', [hash, String(req.params.id)]);
+    if (!q.rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json({ ...q.rows[0], temporary_password: req.body && req.body.password ? undefined : plain });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.get('/api/users/me', authenticateToken, async (req, res) => {
+  try {
+    const q = await pool.query('SELECT id, email, name, role, is_active, takes_leads FROM users WHERE id::text=$1', [String(req.user.id)]);
+    if (!q.rows.length) return res.status(404).json({ error: 'User not found' });
+    const admins = await pool.query("SELECT COUNT(*) AS n FROM users WHERE role='admin'");
+    const u = q.rows[0]; if (!u.role && Number(admins.rows[0].n) === 0) u.role = 'admin';
+    res.json({ ...u, roles: ROLES });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.put('/api/users/:id', authenticateToken, async (req, res) => {
   try {
     const allowed = ['name', 'role', 'is_active', 'takes_leads'];
     const fields = Object.fromEntries(Object.entries(req.body || {}).filter(([k]) => allowed.includes(k)));
     if (!Object.keys(fields).length) return res.status(400).json({ error: 'No valid fields' });
+    if (fields.role !== undefined && !ROLES.includes(fields.role)) return res.status(400).json({ error: `Role must be one of ${ROLES.join(', ')}` });
+    // Role and active-state changes are admin-only; anyone may toggle their own takes_leads / name.
+    if ((fields.role !== undefined || fields.is_active !== undefined) || String(req.params.id) !== String(req.user.id)) {
+      const me = await pool.query('SELECT role FROM users WHERE id::text=$1', [String(req.user.id)]);
+      const admins = await pool.query("SELECT COUNT(*) AS n FROM users WHERE role='admin'");
+      const isAdmin = me.rows.length && (me.rows[0].role === 'admin' || Number(admins.rows[0].n) === 0);
+      if (!isAdmin) return res.status(403).json({ error: 'Only an admin can change roles or other users' });
+      if (fields.is_active === false && String(req.params.id) === String(req.user.id)) return res.status(400).json({ error: 'You cannot deactivate yourself' });
+    }
     const cols = Object.keys(fields);
     const q = await pool.query(`UPDATE users SET ${cols.map((c, i) => `${c}=$${i + 1}`).join(', ')} WHERE id::text=$${cols.length + 1} RETURNING id, email, name, role, is_active, takes_leads, last_assigned_at`, [...cols.map((c) => fields[c]), String(req.params.id)]);
     if (!q.rows.length) return res.status(404).json({ error: 'User not found' });
@@ -1093,8 +1226,9 @@ const LEAD_SCAN_INTERVAL_MIN = parseInt(process.env.LEAD_SCAN_INTERVAL_MIN || '6
 app.get('/api/leads/scan/status', authenticateToken, async (req, res) => {
   try {
     const counts = await pool.query("SELECT COUNT(*) AS scanned, SUM(CASE WHEN classification='recruiter_lead' THEN 1 ELSE 0 END) AS leads FROM email_scan_log");
+    const connected = await mailOAuth.connectedMailboxes(pool).catch(() => []);
     res.json({
-      mailboxes: leadScanner.publicMailboxes(),
+      mailboxes: [...leadScanner.publicMailboxes(), ...connected.map((b) => ({ address: b.address, provider: b.provider, host: null, last_scanned_at: b.connection.last_scanned_at }))],
       ai_configured: leadScanner.isLeadAIConfigured(),
       scan_interval_minutes: LEAD_SCAN_INTERVAL_MIN,
       running: leadScanState.running,
@@ -1121,11 +1255,50 @@ async function runLeadScan(opts = {}) {
   }
 }
 
+// ---- Direct mailbox integrations (Gmail / Outlook via OAuth) ----
+leadScanner.extraMailboxes = () => mailOAuth.connectedMailboxes(pool);
+leadScanner.fetchConnectedMessages = (box, opts) => mailOAuth.fetchConnectedMessages(pool, box, opts);
+app.get('/api/integrations', authenticateToken, async (req, res) => {
+  try {
+    res.json({ providers: mailOAuth.providerStatus(), connections: await mailOAuth.listConnections(pool), env_mailboxes: leadScanner.publicMailboxes() });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.get('/api/integrations/:provider/connect', authenticateToken, (req, res) => {
+  try { res.json({ url: mailOAuth.buildAuthUrl(req.params.provider, req.user.id) }); }
+  catch (err) { res.status(err.status || 500).json({ error: err.message }); }
+});
+// Public: the provider sends the browser here after consent; state proves who started it.
+app.get('/api/integrations/:provider/callback', async (req, res) => {
+  const back = (params) => res.redirect(`${mailOAuth.APP_URL}/?${new URLSearchParams(params)}`);
+  try {
+    if (req.query.error) return back({ connect_error: `${req.query.error}: ${req.query.error_description || ''}`.trim() });
+    const conn = await mailOAuth.completeConnection(pool, { provider: req.params.provider, code: String(req.query.code || ''), state: String(req.query.state || '') });
+    back({ connected: conn.address, provider: conn.provider });
+  } catch (err) { back({ connect_error: err.message }); }
+});
+app.delete('/api/integrations/:id', authenticateToken, async (req, res) => {
+  try {
+    const q = await pool.query('DELETE FROM mail_connections WHERE id::text=$1 RETURNING id', [String(req.params.id)]);
+    if (!q.rows.length) return res.status(404).json({ error: 'Connection not found' });
+    res.json({ message: 'Disconnected' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.post('/api/integrations/:id/test', authenticateToken, async (req, res) => {
+  try {
+    const q = await pool.query('SELECT * FROM mail_connections WHERE id::text=$1', [String(req.params.id)]);
+    if (!q.rows.length) return res.status(404).json({ error: 'Connection not found' });
+    const [box] = (await mailOAuth.connectedMailboxes(pool)).filter((b) => String(b.connection.id) === String(req.params.id));
+    if (!box) return res.status(409).json({ error: 'Connection needs to be reconnected' });
+    const msgs = await mailOAuth.fetchConnectedMessages(pool, box, { since: new Date(Date.now() - 7 * 86400000).toISOString(), max: 3 });
+    res.json({ ok: true, address: box.address, sample: msgs.map((m) => ({ from: m.from_email, subject: m.subject, received_at: m.received_at })) });
+  } catch (err) { res.status(502).json({ error: err.message }); }
+});
+
 app.post('/api/leads/scan', authenticateToken, async (req, res) => {
   try {
     if (!leadScanner.isLeadAIConfigured()) return res.status(503).json({ error: 'AI not configured (ANTHROPIC_API_KEY missing)', code: 'AI_NOT_CONFIGURED' });
-    const boxes = leadScanner.listMailboxes();
-    if (!boxes.length) return res.status(503).json({ error: 'No mailboxes configured. Set GRAPH_SCAN_MAILBOXES and/or GMAIL_USER+GMAIL_APP_PASSWORD, VERIZON_USER+VERIZON_APP_PASSWORD, or IMAP_MAILBOXES.', code: 'NO_MAILBOXES' });
+    const boxes = [...leadScanner.listMailboxes(), ...(await mailOAuth.connectedMailboxes(pool).catch(() => []))];
+    if (!boxes.length) return res.status(503).json({ error: 'No mailboxes connected. Connect Gmail or Outlook under Settings > Integrations (or set GRAPH_SCAN_MAILBOXES / GMAIL_* / VERIZON_* on the API service).', code: 'NO_MAILBOXES' });
     const { days, max, mailbox } = req.body || {};
     const selected = mailbox ? boxes.filter((b) => b.address.toLowerCase() === String(mailbox).toLowerCase()) : boxes;
     if (!selected.length) return res.status(404).json({ error: `Mailbox ${mailbox} is not configured` });
@@ -1225,6 +1398,7 @@ app.get('/api/opportunities', authenticateToken, async (req, res) => {
 });
 app.post('/api/opportunities', authenticateToken, async (req, res) => {
   try {
+    const dup = await checkDuplicate('opportunities', req.body); if (dup) return sendDuplicate(res, 'opportunities', dup);
     const row = await insertRow('opportunities', OPP_COLS, req.body);
     res.status(201).json((await assignRecordNumber('opportunities', row.id)) || row);
   } catch (err) { sendDbError(res, err); }
@@ -1299,7 +1473,8 @@ function startLeadScanScheduler() {
   const hasMailboxes = leadScanner.listMailboxes().length > 0;
   const timer = setInterval(async () => {
     try {
-      if (hasMailboxes) {
+      const connected = await mailOAuth.connectedMailboxes(pool).catch(() => []);
+      if (hasMailboxes || connected.length) {
         const s = await runLeadScan();
         console.log('📬 Lead scan:', JSON.stringify({ created: s.leads_created, updated: s.leads_updated, replies: s.replies_handled || 0, scanned: s.messages_scanned, errors: (s.mailboxes || []).flatMap((m) => m.errors).length }));
       }
@@ -1310,7 +1485,7 @@ function startLeadScanScheduler() {
     }
   }, LEAD_SCAN_INTERVAL_MIN * 60 * 1000);
   if (timer.unref) timer.unref();
-  console.log(`📬 Lead workflow scheduled every ${LEAD_SCAN_INTERVAL_MIN} min${hasMailboxes ? ` (scanning ${leadScanner.listMailboxes().map((b) => b.address).join(', ')})` : ' (follow-ups only; no mailboxes configured)'}`);
+  console.log(`📬 Lead workflow scheduled every ${LEAD_SCAN_INTERVAL_MIN} min${hasMailboxes ? ` (scanning ${leadScanner.listMailboxes().map((b) => b.address).join(', ')})` : ' (env mailboxes: none; connected mailboxes from Settings are scanned too)'}`);
 }
 
 // ====== EMAIL AUTOMATION (Phase 5, Task 4) ======

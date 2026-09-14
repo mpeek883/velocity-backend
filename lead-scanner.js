@@ -252,10 +252,11 @@ async function scanMailboxes(deps) {
   const days = Number(deps.days || process.env.LEAD_SCAN_DAYS || 14);
   const max = Number(deps.max || process.env.LEAD_SCAN_MAX || 50);
   const since = deps.since || new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-  const boxes = deps.mailboxes || listMailboxes();
+  const boxes = deps.mailboxes || [...listMailboxes(), ...(module.exports.extraMailboxes ? await module.exports.extraMailboxes() : [])];
   // Resolve through module.exports so tests can swap the connectors.
   const fetchGraph = deps.fetchGraph || ((box, opts) => module.exports.fetchGraphMessages(box.address, opts));
   const fetchImap = deps.fetchImap || ((box, opts) => module.exports.fetchImapMessages(box, opts));
+  const fetchConnected = deps.fetchConnected || ((box, opts) => module.exports.fetchConnectedMessages(box, opts));
   const classify = deps.classify || ((msg) => module.exports.classifyMessage(msg));
 
   const summary = { started_at: new Date().toISOString(), since, mailboxes: [], leads_created: 0, leads_updated: 0, messages_scanned: 0 };
@@ -264,7 +265,9 @@ async function scanMailboxes(deps) {
     summary.mailboxes.push(r);
     let messages = [];
     try {
-      messages = box.provider === 'graph' ? await fetchGraph(box, { since, max }) : await fetchImap(box, { since, max });
+      messages = box.provider === 'graph' ? await fetchGraph(box, { since, max })
+        : box.connection ? await fetchConnected(box, { since, max })
+        : await fetchImap(box, { since, max });
     } catch (err) {
       r.errors.push(`mailbox read failed: ${err.message}`);
       continue;
