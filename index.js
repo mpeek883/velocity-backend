@@ -1172,6 +1172,16 @@ app.post('/api/users/:id/password', authenticateToken, requireAdmin, async (req,
     res.json({ ...q.rows[0], temporary_password: req.body && req.body.password ? undefined : plain });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+app.delete('/api/users/:id', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    if (String(req.params.id) === String(req.user.id)) return res.status(400).json({ error: 'You cannot delete yourself' });
+    // Their open leads go back to the pool so nothing is orphaned.
+    await pool.query('UPDATE leads SET assigned_to=NULL, assigned_at=NULL WHERE assigned_to=$1', [String(req.params.id)]);
+    const q = await pool.query('DELETE FROM users WHERE id::text=$1 RETURNING id, email', [String(req.params.id)]);
+    if (!q.rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json({ message: 'Deleted', ...q.rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 app.get('/api/users/me', authenticateToken, async (req, res) => {
   try {
     const q = await pool.query('SELECT id, email, name, role, is_active, takes_leads FROM users WHERE id::text=$1', [String(req.user.id)]);
