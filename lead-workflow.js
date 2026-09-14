@@ -186,7 +186,11 @@ async function findOrCreateAccount(pool, name, extra = {}) {
   const found = await pool.query('SELECT * FROM accounts WHERE LOWER(name)=LOWER($1) ORDER BY id LIMIT 1', [clean]);
   if (found.rows.length) return found.rows[0];
   const ins = await pool.query('INSERT INTO accounts (name, website) VALUES ($1, $2) RETURNING *', [clean, extra.website || null]);
-  return ins.rows[0];
+  const row = ins.rows[0];
+  try {
+    const num = await pool.query('UPDATE accounts SET account_no=(SELECT COALESCE(MAX(account_no),0)+1 FROM accounts) WHERE id::text=$1 AND account_no IS NULL RETURNING *', [String(row.id)]);
+    return num.rows[0] || row;
+  } catch { return row; }
 }
 
 async function createOpportunityFromLead(pool, lead, analysis = {}) {
@@ -210,7 +214,11 @@ async function createOpportunityFromLead(pool, lead, analysis = {}) {
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
     [`${clientName} - ${title}`, clientName, account ? String(account.id) : null, lead.name, lead.email, rateNum, 'Qualification', 40, 'New Business', notes,
       lead.job_title || null, lead.job_description || null, clientName, lead.rate_or_salary || null, lead.job_location || null, lead.work_arrangement || null, String(lead.id)]);
-  return ins.rows[0];
+  const row = ins.rows[0];
+  try {
+    const num = await pool.query('UPDATE opportunities SET opportunity_no=(SELECT COALESCE(MAX(opportunity_no),0)+1 FROM opportunities) WHERE id::text=$1 AND opportunity_no IS NULL RETURNING *', [String(row.id)]);
+    return num.rows[0] || row;
+  } catch { return row; }
 }
 
 /**
@@ -246,6 +254,7 @@ async function handleInboundReply(pool, lead, msg, options = {}) {
     }
     const opp = await createOpportunityFromLead(pool, current, analysis);
     current = await setLead(pool, current.id, { workflow_status: 'opportunity_created', opportunity_id: String(opp.id), follow_up_due_at: null, missing_info: '[]' });
+    if (module.exports.onLeadUpdated) { try { await module.exports.onLeadUpdated(current); } catch { /* mirror is best-effort */ } }
     return { action: 'opportunity_created', lead: current, opportunity: opp, analysis };
   }
   // Unclear: keep waiting, but give them another window.

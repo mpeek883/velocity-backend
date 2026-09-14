@@ -314,10 +314,12 @@ async function scanMailboxes(deps) {
                 `UPDATE leads SET ${cols.map((c, i) => `${c}=$${i + 1}`).join(', ')}, updated_at=CURRENT_TIMESTAMP WHERE id=$${cols.length + 1}`,
                 [...cols.map((c) => merged[c]), cur.id]);
               leadId = cur.id; r.leads_updated += 1; summary.leads_updated += 1;
+              if (module.exports.onLeadUpdated) { try { await module.exports.onLeadUpdated({ ...cur, ...merged, id: cur.id }); } catch (e) { r.errors.push(`post-update hook: ${e.message}`); } }
             } else {
               const cols = Object.keys(lead);
-              const ins = await pool.query(`INSERT INTO leads (${cols.join(', ')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING id`, cols.map((c) => lead[c]));
+              const ins = await pool.query(`INSERT INTO leads (${cols.join(', ')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING *`, cols.map((c) => lead[c]));
               leadId = ins.rows[0].id; r.leads_created += 1; summary.leads_created += 1;
+              if (module.exports.onLeadCreated) { try { await module.exports.onLeadCreated(ins.rows[0]); } catch (e) { r.errors.push(`post-create hook: ${e.message}`); } }
             }
           } else {
             r.not_recruiter += 1;

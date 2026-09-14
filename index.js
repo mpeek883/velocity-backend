@@ -14,6 +14,9 @@ const { runAssistantChat, isAIConfigured: isAssistantConfigured } = require('./a
 const { buildCandidateProfile, markdownToHtml, isProfileAIConfigured } = require('./candidate-profile');
 const leadScanner = require('./lead-scanner');
 const leadWorkflow = require('./lead-workflow');
+const contactsSync = require('./contacts-sync');
+const leadAssignment = require('./lead-assignment');
+const matching = require('./matching');
 
 // Resume uploads are held in memory (never written to disk) and capped at 5 MB.
 const resumeUpload = multer({
@@ -45,6 +48,7 @@ const REQUIRED_COLUMNS = {
     email_received_at: 'TIMESTAMP', workflow_status: "VARCHAR(50) DEFAULT 'new'", end_client: 'VARCHAR(255)', employment_type: 'VARCHAR(50)',
     work_arrangement: 'VARCHAR(50)', missing_info: 'TEXT', reviewed_at: 'TIMESTAMP', replied_at: 'TIMESTAMP', last_inbound_at: 'TIMESTAMP',
     follow_up_due_at: 'TIMESTAMP', opportunity_id: 'TEXT', account_id: 'TEXT', origin: "VARCHAR(20) DEFAULT 'manual'",
+    lead_no: 'INTEGER', assigned_to: 'TEXT', assigned_at: 'TIMESTAMP',
     created_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP', updated_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
   },
   opportunities: {
@@ -52,11 +56,38 @@ const REQUIRED_COLUMNS = {
     stage: "VARCHAR(50) DEFAULT 'Prospecting'", probability: 'INTEGER DEFAULT 20', close_date: 'DATE', type: "VARCHAR(50) DEFAULT 'New Business'",
     competitor: 'VARCHAR(255)', notes: 'TEXT', forecast_category: 'VARCHAR(50)', win_loss_reason: 'TEXT', job_title: 'VARCHAR(255)', job_description: 'TEXT',
     client_name: 'VARCHAR(255)', rate: 'VARCHAR(100)', work_location: 'VARCHAR(255)', work_arrangement: 'VARCHAR(50)', lead_id: 'TEXT',
+    opportunity_no: 'INTEGER',
     created_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP', updated_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
   },
-  accounts: { name: 'VARCHAR(255)', industry: 'VARCHAR(100)', size: 'VARCHAR(50)', website: 'VARCHAR(255)', billing_contact: 'VARCHAR(255)', created_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP', updated_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' },
-  contacts: { name: 'VARCHAR(255)', email: 'VARCHAR(255)', phone: 'VARCHAR(50)', company: 'VARCHAR(255)', title: 'VARCHAR(255)', created_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP', updated_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' },
+  accounts: { name: 'VARCHAR(255)', industry: 'VARCHAR(100)', size: 'VARCHAR(50)', website: 'VARCHAR(255)', billing_contact: 'VARCHAR(255)', account_no: 'INTEGER', created_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP', updated_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' },
+  contacts: {
+    name: 'VARCHAR(255)', email: 'VARCHAR(255)', phone: 'VARCHAR(50)', company: 'VARCHAR(255)', title: 'VARCHAR(255)',
+    contact_type: 'VARCHAR(20)', skills: 'TEXT', candidate_id: 'TEXT', lead_id: 'TEXT', account_id: 'TEXT', source: 'VARCHAR(100)', status: "VARCHAR(50) DEFAULT 'active'", score: 'INTEGER', notes: 'TEXT',
+    created_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP', updated_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+  },
+  users: { name: 'VARCHAR(255)', role: 'VARCHAR(50)', is_active: 'BOOLEAN DEFAULT TRUE', takes_leads: 'BOOLEAN DEFAULT TRUE', last_assigned_at: 'TIMESTAMP' },
 };
+
+// Human-visible record numbers (L-000012 / O-000004 / A-000009) so a lead, its
+// opportunity, and the account can be referenced and cross-checked by eye.
+const RECORD_NUMBERS = { leads: 'lead_no', opportunities: 'opportunity_no', accounts: 'account_no' };
+async function assignRecordNumber(table, id) {
+  const col = RECORD_NUMBERS[table];
+  if (!col) return null;
+  const q = await pool.query(
+    `UPDATE ${table} SET ${col}=(SELECT COALESCE(MAX(${col}),0)+1 FROM ${table}) WHERE id::text=$1 AND ${col} IS NULL RETURNING *`, [String(id)]);
+  return q.rows[0] || null;
+}
+async function backfillRecordNumbers() {
+  for (const [table, col] of Object.entries(RECORD_NUMBERS)) {
+    try {
+      const rows = await pool.query(`SELECT id FROM ${table} WHERE ${col} IS NULL ORDER BY created_at, id`);
+      for (const r of rows.rows) await assignRecordNumber(table, r.id);
+    } catch (err) {
+      console.error(`⚠️ Record numbering for ${table} failed:`, err.message);
+    }
+  }
+}
 
 async function logSchemaSummary() {
   try {
@@ -127,12 +158,35 @@ async function ensureSchema() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`,
-    // Legacy-safe: make sure every column the routes use exists on leads,
-    // opportunities, accounts, contacts (no-ops on fresh databases).
-    ...Object.entries(REQUIRED_COLUMNS).flatMap(([table, cols]) =>
-      Object.entries(cols).map(([col, type]) => `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${col} ${type}`)),
-    "UPDATE leads SET origin='system' WHERE origin IS NULL AND message_id IS NOT NULL",
-    "UPDATE leads SET origin='manual' WHERE origin IS NULL",
+    `CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      org_id INTEGER,
+      email VARCHAR(255) UNIQUE NOT NULL,
+      password_hash VARCHAR(255) NOT NULL,
+      name VARCHAR(255),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS accounts (
+      id SERIAL PRIMARY KEY,
+      name VARCHAR(255),
+      industry VARCHAR(100),
+      size VARCHAR(50),
+      website VARCHAR(255),
+      billing_contact VARCHAR(255),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS contacts (
+      id SERIAL PRIMARY KEY,
+      name VARCHAR(255),
+      email VARCHAR(255),
+      phone VARCHAR(50),
+      company VARCHAR(255),
+      title VARCHAR(255),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
     // lead_id is TEXT so it works whether leads.id is SERIAL (fresh) or UUID (legacy).
     `CREATE TABLE IF NOT EXISTS lead_emails (
       id SERIAL PRIMARY KEY,
@@ -173,6 +227,22 @@ async function ensureSchema() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`,
+    `CREATE TABLE IF NOT EXISTS candidate_matches (
+      id SERIAL PRIMARY KEY,
+      target_kind VARCHAR(20),
+      target_id TEXT,
+      candidate_id TEXT,
+      rank INTEGER,
+      score INTEGER,
+      deterministic_score INTEGER,
+      ai_score INTEGER,
+      breakdown TEXT,
+      rationale TEXT,
+      strengths TEXT,
+      gaps TEXT,
+      model VARCHAR(100),
+      computed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
     `CREATE TABLE IF NOT EXISTS email_scan_log (
       id SERIAL PRIMARY KEY,
       mailbox VARCHAR(255),
@@ -198,6 +268,13 @@ async function ensureSchema() {
       model VARCHAR(100),
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`,
+    // Legacy-safe: make sure every column the routes use exists on leads,
+    // opportunities, accounts, contacts, users (no-ops on fresh databases).
+    ...Object.entries(REQUIRED_COLUMNS).flatMap(([table, cols]) =>
+      Object.entries(cols).map(([col, type]) => `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${col} ${type}`)),
+    "UPDATE leads SET origin='system' WHERE origin IS NULL AND message_id IS NOT NULL",
+    "UPDATE leads SET origin='manual' WHERE origin IS NULL",
+    "UPDATE contacts SET contact_type='Company' WHERE contact_type IS NULL",
   ];
   let failures = 0;
   for (const sql of statements) {
@@ -209,6 +286,13 @@ async function ensureSchema() {
     }
   }
   console.log(failures ? `⚠️ Schema check complete with ${failures} failure(s)` : '✅ Schema check complete');
+  await backfillRecordNumbers();
+  try {
+    const b = await contactsSync.backfillContacts(pool);
+    if (b.candidates || b.leads) console.log('👥 Contacts synced:', JSON.stringify(b));
+  } catch (err) {
+    console.error('⚠️ Contacts backfill failed:', err.message);
+  }
   await logSchemaSummary();
 }
 
@@ -517,31 +601,31 @@ app.get('/api/contacts', authenticateToken, async (req, res) => {
   }
 });
 
+const CONTACT_COLS = ['name', 'email', 'phone', 'company', 'title', 'contact_type', 'skills', 'status', 'notes', 'source', 'score'];
 app.post('/api/contacts', authenticateToken, async (req, res) => {
   try {
-    const { name, email, phone, company, title } = req.body;
-    const result = await pool.query(
-      'INSERT INTO contacts (name, email, phone, company, title) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [name, email, phone, company, title]
-    );
-    res.status(201).json(result.rows[0]);
+    const body = { contact_type: 'Company', ...(req.body || {}) };
+    if (Array.isArray(body.skills)) body.skills = contactsSync.skillsToText(body.skills);
+    res.status(201).json(await insertRow('contacts', CONTACT_COLS, body));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendDbError(res, err);
   }
 });
 
 app.put('/api/contacts/:id', authenticateToken, async (req, res) => {
   try {
-    const { id } = req.params;
-    const { name, email, phone, company, title } = req.body;
-    const result = await pool.query(
-      'UPDATE contacts SET name=$1, email=$2, phone=$3, company=$4, title=$5 WHERE id=$6 RETURNING *',
-      [name, email, phone, company, title, id]
-    );
-    res.json(result.rows[0] || { error: 'Not found' });
+    const body = { ...(req.body || {}) };
+    if (Array.isArray(body.skills)) body.skills = contactsSync.skillsToText(body.skills);
+    const row = await updateRow('contacts', CONTACT_COLS, req.params.id, body);
+    if (!row) return res.status(404).json({ error: 'Not found' });
+    res.json(row);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendDbError(res, err);
   }
+});
+// Re-sync every candidate and lead into Contacts on demand.
+app.post('/api/contacts/sync', authenticateToken, async (req, res) => {
+  try { res.json(await contactsSync.backfillContacts(pool)); } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.delete('/api/contacts/:id', authenticateToken, async (req, res) => {
@@ -571,7 +655,7 @@ app.post('/api/accounts', authenticateToken, async (req, res) => {
       'INSERT INTO accounts (name, industry, size, website, billing_contact) VALUES ($1, $2, $3, $4, $5) RETURNING *',
       [name, industry, size, website, billing_contact]
     );
-    res.status(201).json(result.rows[0]);
+    res.status(201).json((await assignRecordNumber('accounts', result.rows[0].id)) || result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -589,7 +673,9 @@ app.get('/api/candidates', authenticateToken, async (req, res) => {
 
 app.post('/api/candidates', authenticateToken, async (req, res) => {
   try {
-    res.status(201).json(await insertRow('candidates', CANDIDATE_COLS, req.body));
+    const row = await insertRow('candidates', CANDIDATE_COLS, req.body);
+    contactsSync.syncContactFromCandidate(pool, row).catch((e) => console.error('⚠️ Contact sync (candidate) failed:', e.message));
+    res.status(201).json(row);
   } catch (err) {
     sendDbError(res, err);
   }
@@ -599,6 +685,7 @@ app.put('/api/candidates/:id', authenticateToken, async (req, res) => {
   try {
     const row = await updateRow('candidates', CANDIDATE_COLS, req.params.id, req.body);
     if (!row) return res.status(404).json({ error: 'Candidate not found' });
+    contactsSync.syncContactFromCandidate(pool, row).catch((e) => console.error('⚠️ Contact sync (candidate) failed:', e.message));
     res.json(row);
   } catch (err) {
     sendDbError(res, err);
@@ -868,15 +955,65 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+// After a lead is created (manually or by the scanner): number it, assign it
+// fairly, and mirror the recruiter into Contacts.
+async function afterLeadCreated(row, { assignTo } = {}) {
+  let lead = row;
+  try { lead = (await assignRecordNumber('leads', lead.id)) || lead; } catch (e) { console.error('⚠️ Lead numbering failed:', e.message); }
+  try { const a = await leadAssignment.assignLead(pool, lead, assignTo || null); if (a.lead) lead = a.lead; } catch (e) { console.error('⚠️ Lead assignment failed:', e.message); }
+  try { await contactsSync.syncContactFromLead(pool, lead); } catch (e) { console.error('⚠️ Contact sync (lead) failed:', e.message); }
+  return lead;
+}
+leadScanner.onLeadCreated = (row) => afterLeadCreated(row);
+leadScanner.onLeadUpdated = (row) => contactsSync.syncContactFromLead(pool, row).catch(() => {});
+leadWorkflow.onLeadUpdated = (row) => contactsSync.syncContactFromLead(pool, row).catch(() => {});
+
 app.post('/api/leads', authenticateToken, async (req, res) => {
-  try { res.status(201).json(await insertRow('leads', LEAD_COLS, req.body)); } catch (err) { sendDbError(res, err); }
+  try {
+    const { assigned_to, ...body } = req.body || {};
+    const row = await insertRow('leads', LEAD_COLS, body);
+    res.status(201).json(await afterLeadCreated(row, { assignTo: assigned_to }));
+  } catch (err) { sendDbError(res, err); }
 });
 app.put('/api/leads/:id', authenticateToken, async (req, res) => {
   try {
-    const row = await updateRow('leads', LEAD_COLS, req.params.id, req.body);
+    const { assigned_to, ...body } = req.body || {};
+    let row = Object.keys(body).length ? await updateRow('leads', LEAD_COLS, req.params.id, body) : await loadLead(req.params.id);
     if (!row) return res.status(404).json({ error: 'Lead not found' });
+    if (assigned_to !== undefined && String(assigned_to || '') !== String(row.assigned_to || '')) {
+      row = assigned_to ? (await leadAssignment.assignLead(pool, row, assigned_to)).lead
+        : (await pool.query('UPDATE leads SET assigned_to=NULL, assigned_at=NULL WHERE id::text=$1 RETURNING *', [String(row.id)])).rows[0];
+    }
+    contactsSync.syncContactFromLead(pool, row).catch(() => {});
     res.json(row);
   } catch (err) { sendDbError(res, err); }
+});
+
+// Team + assignment
+app.get('/api/users', authenticateToken, async (req, res) => {
+  try { res.json(await leadAssignment.listTeam(pool)); } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.put('/api/users/:id', authenticateToken, async (req, res) => {
+  try {
+    const allowed = ['name', 'role', 'is_active', 'takes_leads'];
+    const fields = Object.fromEntries(Object.entries(req.body || {}).filter(([k]) => allowed.includes(k)));
+    if (!Object.keys(fields).length) return res.status(400).json({ error: 'No valid fields' });
+    const cols = Object.keys(fields);
+    const q = await pool.query(`UPDATE users SET ${cols.map((c, i) => `${c}=$${i + 1}`).join(', ')} WHERE id::text=$${cols.length + 1} RETURNING id, email, name, role, is_active, takes_leads, last_assigned_at`, [...cols.map((c) => fields[c]), String(req.params.id)]);
+    if (!q.rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json(q.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.post('/api/leads/:id/assign', authenticateToken, async (req, res) => {
+  try {
+    const lead = await loadLead(req.params.id);
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+    const r = await leadAssignment.assignLead(pool, lead, (req.body && req.body.user_id) || null);
+    res.json({ lead: r.lead, assigned_to_user: r.user, reason: r.reason || null });
+  } catch (err) { res.status(err.status || 500).json({ error: err.message }); }
+});
+app.post('/api/leads/assign-unassigned', authenticateToken, async (req, res) => {
+  try { res.json(await leadAssignment.assignUnassigned(pool)); } catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.delete('/api/leads/:id', authenticateToken, async (req, res) => {
   try {
@@ -1023,8 +1160,61 @@ app.get('/api/opportunities', authenticateToken, async (req, res) => {
   try { res.json((await pool.query('SELECT * FROM opportunities ORDER BY created_at DESC')).rows); } catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.post('/api/opportunities', authenticateToken, async (req, res) => {
-  try { res.status(201).json(await insertRow('opportunities', OPP_COLS, req.body)); } catch (err) { sendDbError(res, err); }
+  try {
+    const row = await insertRow('opportunities', OPP_COLS, req.body);
+    res.status(201).json((await assignRecordNumber('opportunities', row.id)) || row);
+  } catch (err) { sendDbError(res, err); }
 });
+
+// ---- AI candidate matching ----
+async function runMatch(targetKind, id, body = {}) {
+  let target;
+  if (targetKind === 'opportunity') {
+    const q = await pool.query('SELECT * FROM opportunities WHERE id::text=$1', [String(id)]);
+    if (!q.rows.length) return null;
+    target = matching.targetFromOpportunity(q.rows[0]);
+  } else {
+    const q = await pool.query('SELECT * FROM job_orders WHERE id::text=$1', [String(id)]);
+    if (!q.rows.length) return null;
+    target = matching.targetFromJobOrder(q.rows[0]);
+  }
+  const results = await matching.rankCandidates({ pool, target, limit: body.limit || 10, aiTop: body.ai_top ?? 5, useAI: body.use_ai !== false });
+  await matching.storeMatches(pool, target, results);
+  return { target: { kind: target.kind, id: target.id, title: target.title }, matches: results, ai_used: results.some((r) => r.ai_score != null), computed_at: new Date().toISOString() };
+}
+async function readMatches(targetKind, id) {
+  const q = await pool.query('SELECT * FROM candidate_matches WHERE target_kind=$1 AND target_id=$2 ORDER BY rank', [targetKind, String(id)]);
+  if (!q.rows.length) return null;
+  const ids = q.rows.map((r) => r.candidate_id);
+  const cands = await pool.query('SELECT id, name, title, location, skills, availability FROM candidates WHERE id::text = ANY($1)', [ids]);
+  const byId = new Map(cands.rows.map((c) => [String(c.id), c]));
+  return {
+    computed_at: q.rows[0].computed_at,
+    matches: q.rows.map((r) => ({
+      candidate_id: r.candidate_id, candidate_name: (byId.get(r.candidate_id) || {}).name, candidate_title: (byId.get(r.candidate_id) || {}).title,
+      candidate_location: (byId.get(r.candidate_id) || {}).location, candidate_skills: (byId.get(r.candidate_id) || {}).skills,
+      rank: r.rank, score: r.score, deterministic_score: r.deterministic_score, ai_score: r.ai_score,
+      breakdown: r.breakdown ? JSON.parse(r.breakdown) : null,
+      ai: r.rationale || r.strengths || r.gaps ? { rationale: r.rationale, strengths: r.strengths ? JSON.parse(r.strengths) : [], gaps: r.gaps ? JSON.parse(r.gaps) : [], model: r.model } : null,
+    })),
+  };
+}
+for (const [kind, base] of [['opportunity', '/api/opportunities'], ['job_order', '/api/job-orders']]) {
+  app.post(`${base}/:id/match`, authenticateToken, async (req, res) => {
+    try {
+      const out = await runMatch(kind, req.params.id, req.body || {});
+      if (!out) return res.status(404).json({ error: 'Not found' });
+      res.json(out);
+    } catch (err) { res.status(err.status || 502).json({ error: err.message }); }
+  });
+  app.get(`${base}/:id/matches`, authenticateToken, async (req, res) => {
+    try {
+      const out = await readMatches(kind, req.params.id);
+      if (!out) return res.status(404).json({ error: 'No matches computed yet' });
+      res.json(out);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+}
 app.put('/api/opportunities/:id', authenticateToken, async (req, res) => {
   try {
     const row = await updateRow('opportunities', OPP_COLS, req.params.id, req.body);
