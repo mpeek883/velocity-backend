@@ -17,7 +17,7 @@ const { sendEmail, textToHtml, FROM_EMAIL } = require('./email');
 const MODEL = process.env.LEAD_AI_MODEL || 'claude-opus-5';
 const FOLLOW_UP_BUSINESS_DAYS = parseInt(process.env.LEAD_FOLLOW_UP_BUSINESS_DAYS || '3', 10);
 
-const SIGNATURE = process.env.LEAD_REPLY_SIGNATURE || 'Best regards,\n\nBrad Peek\nManaging Member | PEEK IT Services LLC\n301-710-4423\nbradpeek@peekitservices.com\npeekitservices.com';
+const SIGNATURE = process.env.LEAD_REPLY_SIGNATURE || 'Best regards,\n\nBrad Peek\nManaging Member | Peek Talent Solutions\n301-710-4423\nbradpeek@peekitservices.com\npeekitservices.com';
 const NETWORK_SIZE = process.env.LEAD_NETWORK_SIZE || '5,000+';
 
 const CRITICAL_FIELDS = [
@@ -83,9 +83,9 @@ async function draftOfferReply(lead, options = {}) {
   if (!isAIConfigured() && !options.client) return { ...templateOfferReply(lead, missing), missing, model: 'template' };
   const client = options.client || getClient();
   const system = [
-    'You write short, warm, professional replies on behalf of Brad Peek, Managing Member of PEEK IT Services LLC, a staffing firm.',
+    'You write short, warm, professional replies on behalf of Brad Peek, Managing Member of Peek Talent Solutions, a staffing firm.',
     'A recruiter or headhunter has emailed Brad about a role. Write the reply as Brad, in plain text, no markdown, no subject line inside the body, and do not include a signature (it is appended automatically).',
-    'The reply MUST: (1) thank them for their email and for considering Brad\'s credentials for the role; (2) explain that Brad is not personally available for this role, but that PEEK IT would be happy to help them find a resource by working its network of ' + NETWORK_SIZE + ' qualified professionals to identify people who are available and interested; (3) say that once a match is identified, a candidate profile will be sent over for their consideration, and that if they or their client want to interview the candidate they can coordinate with PEEK IT to arrange it; (4) if any critical details are missing, ask for them specifically; (5) close by inviting them to confirm they would like PEEK IT\'s help.',
+    'The reply MUST: (1) thank them for their email and for considering Brad\'s credentials for the role; (2) explain that Brad is not personally available for this role, but that Peek Talent Solutions would be happy to help them find a resource by working its network of ' + NETWORK_SIZE + ' qualified professionals to identify people who are available and interested; (3) say that once a match is identified, a candidate profile will be sent over for their consideration, and that if they or their client want to interview the candidate they can coordinate with Peek Talent Solutions to arrange it; (4) if any critical details are missing, ask for them specifically; (5) close by inviting them to confirm they would like Peek Talent Solutions\'s help.',
     'Adapt the tone and specifics to the content of their email. Keep it under 220 words.',
   ].join(' ');
   const context = {
@@ -107,7 +107,7 @@ async function draftOfferReply(lead, options = {}) {
 }
 
 const ReplyAnalysisSchema = z.object({
-  interest: z.enum(['interested', 'not_interested', 'unclear']).describe('Whether the recruiter wants PEEK IT to help fill the role.'),
+  interest: z.enum(['interested', 'not_interested', 'unclear']).describe('Whether the recruiter wants Peek Talent Solutions to help fill the role.'),
   provided: z.object({
     job_title: z.string(),
     job_description: z.string(),

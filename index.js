@@ -1566,10 +1566,10 @@ app.post('/api/nda/send', authenticateToken, async (req, res) => {
     const { deal_name, deal_value, client_company, client_signatory, signer_email, cover_note, subject, record_contract = true } = req.body || {};
     if (!signer_email) return res.status(400).json({ error: 'Signer email required' });
     const signerFirst = (client_signatory || '').split(' ')[0] || 'Team';
-    const emailBody = cover_note || `Dear ${signerFirst},\n\nPlease find attached a Mutual NDA from Peek IT Services for your review in connection with ${deal_name || 'our engagement'}.\n\nBest regards,\nPeek IT Services`;
+    const emailBody = cover_note || `Dear ${signerFirst},\n\nPlease find attached a Mutual NDA from Peek Talent Solutions for your review in connection with ${deal_name || 'our engagement'}.\n\nBest regards,\nPeek Talent Solutions`;
     const result = await sendEmail({
       to: signer_email,
-      subject: subject || `Mutual NDA for Review - ${deal_name || client_company || 'Peek IT Services'}`,
+      subject: subject || `Mutual NDA for Review - ${deal_name || client_company || 'Peek Talent Solutions'}`,
       html: textToHtml(emailBody),
       text: emailBody,
     });
@@ -1603,10 +1603,10 @@ app.post('/api/submissions/:id/remind', authenticateToken, async (req, res) => {
     const recipient = to || s.candidate_email;
     if (!recipient) return res.status(400).json({ error: 'Candidate has no email address; pass "to" explicitly' });
     const first = (s.candidate_name || 'there').split(' ')[0];
-    const text = `Hi ${first},\n\n${message || `This is a reminder about your upcoming interview for the ${s.job_title || 'open'} role${s.company ? ` at ${s.company}` : ''}. Please reach out if you have any questions.`}\n\nBest regards,\nPeek IT Services`;
+    const text = `Hi ${first},\n\n${message || `This is a reminder about your upcoming interview for the ${s.job_title || 'open'} role${s.company ? ` at ${s.company}` : ''}. Please reach out if you have any questions.`}\n\nBest regards,\nPeek Talent Solutions`;
     const result = await sendEmail({
       to: recipient,
-      subject: `Interview Reminder - ${s.job_title || 'Your submission'}${s.company ? ` at ${s.company}` : ''} | Peek IT`,
+      subject: `Interview Reminder - ${s.job_title || 'Your submission'}${s.company ? ` at ${s.company}` : ''} | Peek Talent Solutions`,
       text,
     });
     res.json({ ok: true, ...result, to: recipient });

@@ -134,8 +134,8 @@ function renderMarkdown(profile, { label, jobOrder, redacted }) {
   if (profile.logistics) { lines.push('## Logistics'); lines.push(profile.logistics); lines.push(''); }
   lines.push('---');
   lines.push(redacted
-    ? '*Identifying details are withheld at this stage. Full contact information is available from Peek IT Services on request.*'
-    : '*Presented by Peek IT Services.*');
+    ? '*Identifying details are withheld at this stage. Full contact information is available from Peek Talent Solutions on request.*'
+    : '*Presented by Peek Talent Solutions.*');
   return lines.join('\n');
 }
 

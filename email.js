@@ -5,7 +5,7 @@
 // Both sets of variables already exist on the Render API service.
 
 const FROM_EMAIL = process.env.FROM_EMAIL || 'bradpeek@peekitservices.com';
-const FROM_NAME = process.env.FROM_NAME || 'Peek IT Services';
+const FROM_NAME = process.env.FROM_NAME || 'Peek Talent Solutions';
 
 function graphConfigured() {
   return Boolean(process.env.MS_TENANT_ID && process.env.MS_CLIENT_ID && process.env.MS_CLIENT_SECRET);

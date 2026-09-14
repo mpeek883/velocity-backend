@@ -6,11 +6,11 @@ const Anthropic = require('@anthropic-ai/sdk');
 
 const MODEL = process.env.AI_CHAT_MODEL || 'claude-opus-5';
 
-const MANUAL = `VelocityCRM by Peek IT Services (Peek Enterprises).
+const MANUAL = `VelocityCRM by Peek Talent Solutions.
 Modules: CRM (Contacts, Accounts, Leads, Opportunities pipeline, Activities, Contracts) and Staffing (Candidates, Job Orders, Submissions, Placements).
 AI features: resume parsing on Add Candidate, Smart Paste extraction (paste a recruiter email, job posting, signature, or notes and the fields are extracted), job description parsing, candidate matching, submission write-ups.
 Integrations: Apollo.io job postings import and sync (Job Orders screen), Microsoft Graph / SMTP email, Render hosting.
-Staffing workflow: Job Order -> Candidate Match -> Submission -> Placement. Peek IT retains 35% of the bill rate; candidate pay rate is 65% of bill rate unless stated otherwise.`;
+Staffing workflow: Job Order -> Candidate Match -> Submission -> Placement. Peek Talent Solutions retains 35% of the bill rate; candidate pay rate is 65% of bill rate unless stated otherwise.`;
 
 function isAIConfigured() {
   return Boolean(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN);
@@ -51,7 +51,7 @@ async function runAssistantChat(input, options = {}) {
   const client = options.client || getClient();
 
   const system = [
-    `You are the VelocityCRM Assistant for Peek IT Services. Current module: "${mod}". User role: ${role}.`,
+    `You are the VelocityCRM Assistant for Peek Talent Solutions. Current module: "${mod}". User role: ${role}.`,
     'Be concise. When asked how to do something in the app, give short numbered steps.',
     'When the user asks for JSON, return only the JSON with no prose, no markdown fences.',
     '',
