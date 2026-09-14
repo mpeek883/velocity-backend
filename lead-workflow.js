@@ -157,7 +157,7 @@ function nudgeEmail(lead, n, missing = []) {
   const need = missing.length ? missing.map((m) => (ASK_LABEL[m.key] || m.label).toLowerCase().replace(/^the /, '')).join(', ').replace(/, ([^,]*)$/, ' and $1') : '';
   const body = n === 1
     ? `Hi ${first},\n\nHope your week is going well. I know recruiter inboxes fill up fast, so I just wanted to float my note back to the top.\n\nIf ${role} is still open, I'd be glad to start lining up a few strong people for you. All I need is a quick "yes" to get moving${need ? `, plus the ${need} so I can aim the search properly` : ''}.\n\nAnd if it's already filled or the timing isn't right, no worries at all, a quick "no" is just as helpful.\n\nThanks, ${first}.`
-    : `Hi ${first},\n\nOne last friendly check-in from me, and then I'll get out of your inbox.\n\nIf you'd still like a hand with ${role}, reply with a "yes" and I'll start sending you candidates this week${need ? ` (the ${need} would help me aim the search)` : ''}. If it has closed out on your side, just let me know and I'll wish you luck with it.\n\nEither way, I appreciate you thinking of me, and I hope our paths cross on the next one.\n\nBest, ${first} - talk soon.`;
+    : `Hi ${first},\n\nOne last friendly check-in from me, and then I'll get out of your inbox.\n\nIf you'd still like a hand with ${role}, reply with a "yes" and I'll start sending you candidates this week${need ? ` (the ${need} would help me aim the search)` : ''}. If it has closed out on your side, just let me know and I'll wish you luck with it.\n\nEither way, I appreciate you thinking of me, and I hope our paths cross on the next one.\n\nThanks again, ${first}.`;
   return { subject: replySubject(lead), body };
 }
 function closeOutEmail(lead) {
