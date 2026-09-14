@@ -18,6 +18,7 @@ const contactsSync = require('./contacts-sync');
 const mailOAuth = require('./mail-oauth');
 const leadAssignment = require('./lead-assignment');
 const matching = require('./matching');
+const sourcing = require('./sourcing');
 
 // Resume uploads are held in memory (never written to disk) and capped at 5 MB.
 const resumeUpload = multer({
@@ -1522,6 +1523,46 @@ app.post('/api/opportunities', authenticateToken, async (req, res) => {
     const dup = await checkDuplicate('opportunities', req.body); if (dup) return sendDuplicate(res, 'opportunities', dup);
     const row = await insertRow('opportunities', OPP_COLS, req.body);
     res.status(201).json((await assignRecordNumber('opportunities', row.id)) || row);
+  } catch (err) { sendDbError(res, err); }
+});
+
+// ---- Candidate sourcing from free boards (driven by a job order) ----
+app.post('/api/sourcing/search', authenticateToken, async (req, res) => {
+  try {
+    const b = req.body || {};
+    let query = String(b.query || '').trim(), location = String(b.location || '').trim();
+    if (b.job_order_id) {
+      const q = await pool.query('SELECT * FROM job_orders WHERE id::text=$1', [String(b.job_order_id)]);
+      if (q.rows.length) { query = query || q.rows[0].title || ''; location = location || q.rows[0].location || ''; }
+    }
+    if (!query) return res.status(400).json({ error: 'query (or job_order_id) is required' });
+    const out = await sourcing.searchAll(query, { location, sources: Array.isArray(b.sources) && b.sources.length ? b.sources : undefined, limit: Number(b.limit) || 20, metro: b.metro });
+    out.google_configured = sourcing.googleConfigured();
+    res.json(out);
+  } catch (err) { res.status(502).json({ error: err.message }); }
+});
+// Import a sourcing hit: read its text, extract candidate fields with the same
+// AI parser as resume upload, and create the candidate (duplicates refused).
+app.post('/api/sourcing/import', authenticateToken, async (req, res) => {
+  try {
+    const hit = (req.body && req.body.result) || {};
+    const text = await sourcing.fetchResultText(hit);
+    if (!text || text.length < 40) return res.status(400).json({ error: 'Not enough text on this result to build a candidate from' });
+    let fields;
+    if (isAIConfigured()) { try { fields = await extractCandidateWithAI(text); } catch (e) { fields = { ...parseResumeText(text), parser: 'rules' }; } }
+    else fields = { ...parseResumeText(text), parser: 'rules' };
+    const body = {
+      name: fields.name || hit.name || 'Unknown candidate', email: fields.email || hit.email || '', phone: fields.phone || '', title: fields.title || hit.title || '',
+      company: fields.company || '', location: fields.location || hit.location || '', skills: fields.skills || [], experience_years: fields.experience_years ?? null,
+      linkedin: fields.linkedin || (hit.resume_link && /linkedin/.test(hit.resume_link) ? hit.resume_link : ''), status: 'active', source: `Sourced: ${hit.source || 'board'}`,
+      resume_text: text.slice(0, 20000), notes: `Imported from ${hit.link || hit.source || 'a sourcing search'}${hit.resume_link ? `
+Resume link: ${hit.resume_link}` : ''}`,
+    };
+    if (Array.isArray(body.skills)) body.skills = body.skills.join(', ');
+    const dup = await checkDuplicate('candidates', body); if (dup) return sendDuplicate(res, 'candidates', dup);
+    const row = await insertRow('candidates', CANDIDATE_COLS, body);
+    contactsSync.syncContactFromCandidate(pool, row).catch(() => {});
+    res.status(201).json({ candidate: row, parser: fields.parser || 'ai' });
   } catch (err) { sendDbError(res, err); }
 });
 
