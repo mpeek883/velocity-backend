@@ -48,7 +48,9 @@ function generalizeLocation(location) {
 /** Remove a candidate's identifying strings from free text. */
 function redactText(text, candidate = {}) {
   let out = String(text || '');
-  out = out.replace(EMAIL_RE, '[email redacted]').replace(URL_RE, '[link redacted]').replace(PHONE_RE, '[phone redacted]').replace(STREET_RE, '[address redacted]');
+  out = out.replace(EMAIL_RE, '[email redacted]').replace(URL_RE, '[link redacted]').replace(PHONE_RE, '[phone redacted]').replace(STREET_RE, '[address redacted]')
+    .replace(/\b\d{5}(?:-\d{4})?\b/g, '') // ZIP codes narrow a home address; region (city/state) is kept
+    .replace(/\b(?:SSN|social security)[^\n.]*/gi, '');
   const name = String(candidate.name || '').trim();
   if (name) {
     const parts = name.split(/\s+/).map((p) => p.replace(/[.,]/g, '')).filter((p) => p.length > 1);
