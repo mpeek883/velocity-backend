@@ -114,14 +114,21 @@ function manualLinks(query, location) {
   ];
 }
 
-async function searchAll(query, { location = '', sources = ['hn', 'craigslist', 'google'], limit = 20, metro, fetchImpl = global.fetch } = {}) {
-  const out = { query, location, results: [], errors: [], meta: {}, links: manualLinks(query, location) };
+const { screenUS } = require('./work-auth');
+async function searchAll(query, { location = '', sources = ['hn', 'craigslist', 'google'], limit = 20, metro, usOnly = true, fetchImpl = global.fetch } = {}) {
+  const out = { query, location, results: [], errors: [], meta: {}, links: manualLinks(query, location), us_only: usOnly, excluded_non_us: 0 };
   const want = new Set(sources);
   const jobs = [];
   if (want.has('hn')) jobs.push(searchHN(query, { limit, fetchImpl }).then((r) => { out.meta.hn = r.thread; out.results.push(...r.results); }).catch((e) => out.errors.push(`Hacker News: ${e.message}`)));
   if (want.has('craigslist')) { const m = metro || metroFor(location) || 'washingtondc'; jobs.push(searchCraigslist(query, { metro: m, limit, fetchImpl }).then((r) => { out.meta.craigslist = { metro: r.metro, label: r.metro_label, url: r.url }; out.results.push(...r.results); }).catch((e) => out.errors.push(`Craigslist: ${e.message}`))); }
   if (want.has('google')) jobs.push(searchGoogle(query, { location, limit, fetchImpl }).then((r) => { out.meta.google = { configured: r.configured }; out.results.push(...r.results); }).catch((e) => out.errors.push(`Google: ${e.message}`)));
   await Promise.all(jobs);
+  // US work authorization: drop posts from outside the US or asking for sponsorship; flag the rest.
+  out.results = out.results.filter((r) => {
+    r.us_work = screenUS({ location: r.location, text: r.text || r.snippet || '' });
+    if (usOnly && r.us_work.eligible === false) { out.excluded_non_us += 1; return false; }
+    return true;
+  });
   out.results.sort((a, b) => (b.score || 0) - (a.score || 0));
   return out;
 }

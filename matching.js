@@ -13,6 +13,7 @@
 // deterministic score. Results are stored per (target, candidate).
 
 const Anthropic = require('@anthropic-ai/sdk');
+const { screenUS } = require('./work-auth');
 const { z } = require('zod');
 const { zodOutputFormat } = require('@anthropic-ai/sdk/helpers/zod');
 
@@ -162,7 +163,23 @@ async function rankCandidates(deps) {
   const limit = Number(deps.limit || 10);
   const aiTop = Number(deps.aiTop ?? 5);
   const useAI = deps.useAI !== false && (deps.client || isMatchAIConfigured());
-  const candidates = deps.candidates || (await pool.query("SELECT * FROM candidates WHERE COALESCE(status,'active') NOT IN ('DNC','dnc') ORDER BY id")).rows;
+  const all = deps.candidates || (await pool.query("SELECT * FROM candidates WHERE COALESCE(status,'active') NOT IN ('DNC','dnc') ORDER BY id")).rows;
+
+  // US work authorization screen (on by default): candidates who need
+  // sponsorship or are outside the US are never ranked; with strict on,
+  // candidates with nothing on file are held back too.
+  const usOnly = deps.usOnly !== false, strictUS = deps.strictUS !== false;
+  const excluded = { not_authorized: 0, unknown: 0 };
+  const candidates = [];
+  const screens = new Map();
+  for (const c of all) {
+    const scr = screenUS({ workAuth: c.work_auth, location: c.location, text: `${c.resume_text || ''}
+${c.notes || ''}` });
+    screens.set(String(c.id), scr);
+    if (usOnly && scr.eligible === false) { excluded.not_authorized += 1; continue; }
+    if (usOnly && strictUS && scr.eligible === null) { excluded.unknown += 1; continue; }
+    candidates.push(c);
+  }
 
   const scored = candidates.map((c) => ({ candidate: c, det: deterministicScore(c, target) }))
     .sort((a, b) => b.det.score - a.det.score);
@@ -176,10 +193,11 @@ async function rankCandidates(deps) {
     }
     const aiScore = ai && ai.overall != null ? Math.round(ai.overall) : null;
     const final = aiScore != null ? Math.round(det.score * 0.4 + aiScore * 0.6) : det.score;
-    results.push({ candidate_id: candidate.id, candidate_name: candidate.name, candidate_title: candidate.title, score: final, deterministic_score: det.score, ai_score: aiScore, breakdown: det.breakdown, ai, rank: 0 });
+    results.push({ candidate_id: candidate.id, candidate_name: candidate.name, candidate_title: candidate.title, score: final, deterministic_score: det.score, ai_score: aiScore, breakdown: det.breakdown, ai, rank: 0, us_work: screens.get(String(candidate.id)) });
   }
   results.sort((a, b) => b.score - a.score);
   results.forEach((r, i) => { r.rank = i + 1; });
+  results.excluded = excluded; results.us_only = usOnly; results.strict_us = strictUS;
   return results;
 }
 

@@ -19,6 +19,7 @@ const mailOAuth = require('./mail-oauth');
 const leadAssignment = require('./lead-assignment');
 const matching = require('./matching');
 const sourcing = require('./sourcing');
+const workAuth = require('./work-auth');
 
 // Resume uploads are held in memory (never written to disk) and capped at 5 MB.
 const resumeUpload = multer({
@@ -1536,7 +1537,7 @@ app.post('/api/sourcing/search', authenticateToken, async (req, res) => {
       if (q.rows.length) { query = query || q.rows[0].title || ''; location = location || q.rows[0].location || ''; }
     }
     if (!query) return res.status(400).json({ error: 'query (or job_order_id) is required' });
-    const out = await sourcing.searchAll(query, { location, sources: Array.isArray(b.sources) && b.sources.length ? b.sources : undefined, limit: Number(b.limit) || 20, metro: b.metro });
+    const out = await sourcing.searchAll(query, { location, sources: Array.isArray(b.sources) && b.sources.length ? b.sources : undefined, limit: Number(b.limit) || 20, metro: b.metro, usOnly: b.us_only !== false });
     out.google_configured = sourcing.googleConfigured();
     res.json(out);
   } catch (err) { res.status(502).json({ error: err.message }); }
@@ -1551,7 +1552,9 @@ app.post('/api/sourcing/import', authenticateToken, async (req, res) => {
     let fields;
     if (isAIConfigured()) { try { fields = await extractCandidateWithAI(text); } catch (e) { fields = { ...parseResumeText(text), parser: 'rules' }; } }
     else fields = { ...parseResumeText(text), parser: 'rules' };
+    const auth = workAuth.classifyWorkAuth(text);
     const body = {
+      work_auth: fields.work_auth || (auth.status === 'authorized' ? 'US work authorized' : auth.status === 'not_authorized' ? 'Needs sponsorship' : ''),
       name: fields.name || hit.name || 'Unknown candidate', email: fields.email || hit.email || '', phone: fields.phone || '', title: fields.title || hit.title || '',
       company: fields.company || '', location: fields.location || hit.location || '', skills: fields.skills || [], experience_years: fields.experience_years ?? null,
       linkedin: fields.linkedin || (hit.resume_link && /linkedin/.test(hit.resume_link) ? hit.resume_link : ''), status: 'active', source: `Sourced: ${hit.source || 'board'}`,
@@ -1578,9 +1581,9 @@ async function runMatch(targetKind, id, body = {}) {
     if (!q.rows.length) return null;
     target = matching.targetFromJobOrder(q.rows[0]);
   }
-  const results = await matching.rankCandidates({ pool, target, limit: body.limit || 10, aiTop: body.ai_top ?? 5, useAI: body.use_ai !== false });
+  const results = await matching.rankCandidates({ pool, target, limit: body.limit || 10, aiTop: body.ai_top ?? 5, useAI: body.use_ai !== false, usOnly: body.us_only !== false, strictUS: body.strict_us_auth !== false });
   await matching.storeMatches(pool, target, results);
-  return { target: { kind: target.kind, id: target.id, title: target.title }, matches: results, ai_used: results.some((r) => r.ai_score != null), computed_at: new Date().toISOString() };
+  return { target: { kind: target.kind, id: target.id, title: target.title }, matches: results, ai_used: results.some((r) => r.ai_score != null), computed_at: new Date().toISOString(), us_only: results.us_only, strict_us_auth: results.strict_us, excluded: results.excluded };
 }
 async function readMatches(targetKind, id) {
   const q = await pool.query('SELECT * FROM candidate_matches WHERE target_kind=$1 AND target_id=$2 ORDER BY rank', [targetKind, String(id)]);
