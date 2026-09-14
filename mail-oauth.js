@@ -212,13 +212,25 @@ async function fetchOutlookMessages(pool, conn, { since, max = 50 } = {}, fetchI
 }
 
 async function listConnections(pool) {
-  const q = await pool.query('SELECT id, provider, address, status, last_error, scopes, connected_by, created_at, updated_at, last_scanned_at FROM mail_connections ORDER BY provider, address');
+  const q = await pool.query('SELECT id, provider, address, host, username, status, last_error, scopes, connected_by, created_at, updated_at, last_scanned_at FROM mail_connections ORDER BY provider, address');
   return q.rows;
 }
-/** Mailbox descriptors for the scanner. */
+/** Default IMAP host for well-known mail domains. */
+function imapHostFor(address) {
+  const domain = String(address || '').split('@')[1] || '';
+  if (/^(verizon\.net|aol\.com|aim\.com)$/i.test(domain)) return 'imap.aol.com';
+  if (/^(gmail\.com|googlemail\.com)$/i.test(domain)) return 'imap.gmail.com';
+  if (/^(yahoo\.com|ymail\.com|rocketmail\.com)$/i.test(domain)) return 'imap.mail.yahoo.com';
+  if (/^(outlook\.com|hotmail\.com|live\.com|msn\.com)$/i.test(domain)) return 'outlook.office365.com';
+  if (/^(icloud\.com|me\.com|mac\.com)$/i.test(domain)) return 'imap.mail.me.com';
+  return '';
+}
+/** Mailbox descriptors for the scanner (OAuth and saved IMAP mailboxes). */
 async function connectedMailboxes(pool) {
   const q = await pool.query("SELECT * FROM mail_connections WHERE status='connected'");
-  return q.rows.map((c) => ({ address: c.address, provider: c.provider === 'google' ? 'gmail_oauth' : 'outlook_oauth', connection: c }));
+  return q.rows.map((c) => c.provider === 'imap'
+    ? { address: c.address, provider: 'imap', host: c.host, port: Number(c.port) || 993, user: c.username || c.address, pass: c.secret, connection: c }
+    : { address: c.address, provider: c.provider === 'google' ? 'gmail_oauth' : 'outlook_oauth', connection: c });
 }
 async function fetchConnectedMessages(pool, box, opts, fetchImpl = global.fetch) {
   try {
@@ -231,4 +243,4 @@ async function fetchConnectedMessages(pool, box, opts, fetchImpl = global.fetch)
   }
 }
 
-module.exports = { PROVIDERS, providerStatus, buildAuthUrl, completeConnection, accessTokenFor, fetchGmailMessages, fetchOutlookMessages, listConnections, connectedMailboxes, fetchConnectedMessages, redirectUri, APP_URL, gmailBodyText };
+module.exports = { PROVIDERS, providerStatus, imapHostFor, buildAuthUrl, completeConnection, accessTokenFor, fetchGmailMessages, fetchOutlookMessages, listConnections, connectedMailboxes, fetchConnectedMessages, redirectUri, APP_URL, gmailBodyText };

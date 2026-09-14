@@ -289,8 +289,10 @@ async function scanMailboxes(deps) {
     let messages = [];
     try {
       messages = box.provider === 'graph' ? await fetchGraph(box, { since, max })
+        : box.provider === 'imap' ? await fetchImap(box, { since, max })
         : box.connection ? await fetchConnected(box, { since, max })
         : await fetchImap(box, { since, max });
+      if (box.connection && box.provider === 'imap') await pool.query('UPDATE mail_connections SET last_scanned_at=CURRENT_TIMESTAMP, last_error=NULL WHERE id=$1', [box.connection.id]).catch(() => {});
     } catch (err) {
       r.errors.push(`mailbox read failed: ${err.message}`);
       continue;

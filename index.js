@@ -71,6 +71,7 @@ const REQUIRED_COLUMNS = {
     created_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP', updated_at: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
   },
   users: { name: 'VARCHAR(255)', role: 'VARCHAR(50)', is_active: 'BOOLEAN DEFAULT TRUE', takes_leads: 'BOOLEAN DEFAULT TRUE', last_assigned_at: 'TIMESTAMP' },
+  mail_connections: { host: 'VARCHAR(255)', port: 'INTEGER', username: 'VARCHAR(255)', secret: 'TEXT' },
 };
 
 // Human-visible record numbers (L-000012 / O-000004 / A-000009) so a lead, its
@@ -1308,6 +1309,32 @@ app.get('/api/integrations/:provider/callback', async (req, res) => {
     back({ connected: conn.address, provider: conn.provider });
   } catch (err) { back({ connect_error: err.message }); }
 });
+// Saved IMAP mailbox (Verizon/AOL, Gmail with an app password, any IMAP host).
+// The app password is typed into the app by the user, tested against the
+// server right away, and stored for the scanner. Never an account password.
+app.post('/api/integrations/imap', authenticateToken, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const address = String(b.address || '').trim().toLowerCase();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(address)) return res.status(400).json({ error: 'A valid mailbox address is required' });
+    const host = String(b.host || mailOAuth.imapHostFor(address) || '').trim();
+    if (!host) return res.status(400).json({ error: 'IMAP host is required (for example imap.aol.com)' });
+    const port = Number(b.port) || 993;
+    const username = String(b.username || address).trim();
+    const secret = String(b.password || '');
+    if (!secret) return res.status(400).json({ error: 'App password is required' });
+    const box = { address, provider: 'imap', host, port, user: username, pass: secret };
+    let sample = [];
+    try { sample = await leadScanner.fetchImapMessages(box, { since: new Date(Date.now() - 7 * 86400000).toISOString(), max: 3 }); }
+    catch (err) { return res.status(400).json({ error: `Could not sign in to ${host} as ${username}: ${err.message}. Use an app password, not the account password, and check IMAP is enabled.` }); }
+    const q = await pool.query(
+      `INSERT INTO mail_connections (provider, address, host, port, username, secret, status, connected_by, scopes)
+       VALUES ('imap',$1,$2,$3,$4,$5,'connected',$6,'imap')
+       ON CONFLICT (provider, address) DO UPDATE SET host=EXCLUDED.host, port=EXCLUDED.port, username=EXCLUDED.username, secret=EXCLUDED.secret, status='connected', last_error=NULL, updated_at=CURRENT_TIMESTAMP
+       RETURNING id, provider, address, host, status`, [address, host, port, username, secret, String(req.user.id)]);
+    res.status(201).json({ connection: q.rows[0], sample: sample.map((m) => ({ from: m.from_email, subject: m.subject, received_at: m.received_at })) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 app.delete('/api/integrations/:id', authenticateToken, async (req, res) => {
   try {
     const q = await pool.query('DELETE FROM mail_connections WHERE id::text=$1 RETURNING id', [String(req.params.id)]);
@@ -1321,9 +1348,55 @@ app.post('/api/integrations/:id/test', authenticateToken, async (req, res) => {
     if (!q.rows.length) return res.status(404).json({ error: 'Connection not found' });
     const [box] = (await mailOAuth.connectedMailboxes(pool)).filter((b) => String(b.connection.id) === String(req.params.id));
     if (!box) return res.status(409).json({ error: 'Connection needs to be reconnected' });
-    const msgs = await mailOAuth.fetchConnectedMessages(pool, box, { since: new Date(Date.now() - 7 * 86400000).toISOString(), max: 3 });
+    const opts = { since: new Date(Date.now() - 7 * 86400000).toISOString(), max: 3 };
+    let msgs;
+    if (box.provider === 'imap') {
+      try { msgs = await leadScanner.fetchImapMessages(box, opts); await pool.query("UPDATE mail_connections SET last_error=NULL, status='connected' WHERE id=$1", [box.connection.id]); }
+      catch (err) { await pool.query('UPDATE mail_connections SET last_error=$1 WHERE id=$2', [err.message, box.connection.id]).catch(() => {}); throw err; }
+    } else {
+      msgs = await mailOAuth.fetchConnectedMessages(pool, box, opts);
+    }
     res.json({ ok: true, address: box.address, sample: msgs.map((m) => ({ from: m.from_email, subject: m.subject, received_at: m.received_at })) });
   } catch (err) { res.status(502).json({ error: err.message }); }
+});
+
+// Re-attach conversations whose lead was deleted and recreated (for example
+// after splitting a recruiter's roles into separate leads). Each orphaned
+// email is moved to the recreated lead for the same recruiter, matching on
+// the role/subject when possible, and the lead's workflow state is restored
+// from the emails already sent.
+app.post('/api/leads/repair-conversations', authenticateToken, async (req, res) => {
+  try {
+    const liveIds = new Set((await pool.query('SELECT id FROM leads')).rows.map((r) => String(r.id)));
+    const orphans = (await pool.query('SELECT * FROM lead_emails ORDER BY created_at, id')).rows.filter((e) => !liveIds.has(String(e.lead_id)));
+    const report = { orphaned_emails: orphans.length, reattached: 0, unmatched: 0, leads_restored: [] };
+    const touched = new Map();
+    for (const e of orphans) {
+      const addr = String((e.direction === 'outbound' ? e.to_email : e.from_email) || '').toLowerCase();
+      if (!addr) { report.unmatched += 1; continue; }
+      const cands = (await pool.query('SELECT * FROM leads WHERE LOWER(email)=$1 ORDER BY created_at, id', [addr])).rows;
+      if (!cands.length) { report.unmatched += 1; continue; }
+      const target = cands.find((l) => leadScanner.sameRole(l, { job_title: '', email_subject: e.subject })) || cands.find((l) => leadScanner.sameRole(l, { job_title: e.subject, email_subject: '' })) || cands[cands.length - 1];
+      await pool.query('UPDATE lead_emails SET lead_id=$1 WHERE id=$2', [String(target.id), e.id]);
+      report.reattached += 1;
+      const t = touched.get(String(target.id)) || { lead: target, emails: [] };
+      t.emails.push(e); touched.set(String(target.id), t);
+    }
+    for (const { lead, emails } of touched.values()) {
+      const all = (await pool.query('SELECT * FROM lead_emails WHERE lead_id=$1 ORDER BY created_at, id', [String(lead.id)])).rows;
+      const offer = all.filter((x) => x.direction === 'outbound' && x.kind === 'offer_reply').pop();
+      const closeOut = all.find((x) => x.kind === 'close_out');
+      const inbound = all.filter((x) => x.direction === 'inbound' && x.kind !== 'outreach').pop();
+      if (!offer || ['opportunity_created', 'declined', 'closed_no_response'].includes(lead.workflow_status)) continue;
+      const missing = leadWorkflow.missingInfo(lead);
+      const status = closeOut ? 'closed_no_response' : (missing.length ? 'awaiting_info' : 'replied');
+      const fields = { workflow_status: status, reviewed_at: lead.reviewed_at || offer.created_at, replied_at: offer.created_at, follow_up_due_at: closeOut ? null : leadWorkflow.addBusinessDays(new Date(inbound && inbound.created_at > offer.created_at ? inbound.created_at : offer.created_at), leadWorkflow.FOLLOW_UP_BUSINESS_DAYS), missing_info: JSON.stringify(missing.map((m) => m.key)), last_inbound_at: inbound ? inbound.created_at : lead.last_inbound_at };
+      const cols = Object.keys(fields);
+      await pool.query(`UPDATE leads SET ${cols.map((c, i) => `${c}=$${i + 1}`).join(', ')}, updated_at=CURRENT_TIMESTAMP WHERE id::text=$${cols.length + 1}`, [...cols.map((c) => fields[c]), String(lead.id)]);
+      report.leads_restored.push({ id: lead.id, lead_no: lead.lead_no, name: lead.name, job_title: lead.job_title, workflow_status: status, emails_reattached: emails.length });
+    }
+    res.json(report);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // Forget scanned messages from one sender so the next scan re-reads them
