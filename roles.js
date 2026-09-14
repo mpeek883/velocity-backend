@@ -28,13 +28,20 @@ const DENY = {
 // Human-readable matrix for the Users & Roles screen.
 const MATRIX = {
   admin: { label: 'Admin', can: ['Everything', 'Add users and change roles', 'Edit or delete any record', 'QuickBooks connection, invoices, digests, maintenance'] },
-  recruiter: { label: 'Recruiter', can: ['Leads, opportunities, accounts, contacts, activities', 'Candidates, job orders, submissions, interviews, offers, placements', 'Client links, outreach, e-signature, timesheets', 'Edit or delete only records they own (assigned or created)'], cannot: ['Users & roles', 'QuickBooks connection, marking invoices paid', 'Weekly digest and maintenance runs'] },
-  sales: { label: 'Sales', can: ['Leads, opportunities, accounts, contacts, activities, contracts', 'Job orders and client intake', 'NDA and SOW e-signature', 'Edit or delete only records they own'], cannot: ['Candidates, submissions, interviews, offers, placements, outreach', 'Timesheets and invoices', 'Users & roles'] },
+  recruiter: { label: 'Recruiter', can: ['Leads, opportunities, accounts, contacts, activities', 'Candidates, job orders, submissions, interviews, offers, placements', 'Client links, outreach, e-signature, timesheets', 'Edit or delete only records they own (assigned or created)'], cannot: ['See leads assigned to others, or submissions and placements created by others', 'Users & roles', 'QuickBooks connection, marking invoices paid', 'Weekly digest and maintenance runs'] },
+  sales: { label: 'Sales', can: ['Leads, opportunities, accounts, contacts, activities, contracts', 'Job orders and client intake', 'NDA and SOW e-signature', 'Edit or delete only records they own'], cannot: ['See leads assigned to others, or submissions and placements created by others', 'Candidates, submissions, interviews, offers, placements, outreach', 'Timesheets and invoices', 'Users & roles'] },
   viewer: { label: 'Viewer', can: ['Read every screen'], cannot: ['Any change'] },
 };
 // Record ownership: non-admins can only change records they own (when an owner is set).
 const OWNED = { leads: ['leads', 'assigned_to'], activities: ['activities', 'created_by'], submissions: ['submissions', 'created_by'], 'job-orders': ['job_orders', 'created_by'], placements: ['placements', 'created_by'] };
 const OWNED_RE = /^\/api\/(leads|activities|submissions|job-orders|placements)\/([^/]+)(\/assign)?$/;
+// Hard visibility scoping (SCOPE_MODE!=off): recruiters and sales see only the
+// leads assigned to them and the submissions / placements they created.
+// Admins and viewers see everything; reports and dashboards stay team-wide.
+const SCOPED = { leads: ['leads', 'assigned_to'], submissions: ['submissions', 'created_by'], placements: ['placements', 'created_by'] };
+const SCOPED_LIST_RE = /^\/api\/(leads|submissions|placements)\/?$/;
+const SCOPED_ITEM_RE = /^\/api\/(leads|submissions|placements)\/([^/]+)(\/.*)?$/;
+const SCOPE_ROLES = ['recruiter', 'sales'];
 
 function createRoleCache(pool, ttlMs = 60000) {
   const cache = new Map();
@@ -67,8 +74,28 @@ function createRoleCache(pool, ttlMs = 60000) {
 function enforce({ pool, jwt, secret, cache }) {
   const roles = cache || createRoleCache(pool);
   const mw = async (req, res, next) => {
-    if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
     const p = req.path || '';
+    if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+      if (req.method !== 'GET' || process.env.SCOPE_MODE === 'off' || !(SCOPED_LIST_RE.test(p) || SCOPED_ITEM_RE.test(p))) return next();
+      const auth = req.headers['authorization']; const token = auth && auth.split(' ')[1];
+      if (!token) return next();
+      let user; try { user = jwt.verify(token, typeof secret === 'function' ? secret() : secret); } catch { return next(); }
+      const role = await roles.roleFor(user.id);
+      req.userRole = role;
+      if (!SCOPE_ROLES.includes(role)) return next();
+      const lm = p.match(SCOPED_LIST_RE);
+      if (lm) { req.scopeOwner = { table: SCOPED[lm[1]][0], column: SCOPED[lm[1]][1], user_id: String(user.id) }; return next(); }
+      const im = p.match(SCOPED_ITEM_RE);
+      if (im) {
+        const [table, col] = SCOPED[im[1]];
+        try {
+          const q = await pool.query(`SELECT ${col} AS owner FROM ${table} WHERE id::text=$1`, [String(im[2])]);
+          const owner = q.rows.length ? q.rows[0].owner : null;
+          if (owner != null && String(owner) !== String(user.id)) return res.status(403).json({ error: 'This record belongs to another team member.', code: 'NOT_OWNER' });
+        } catch { /* not a record id (e.g. /api/leads/scan): allow */ }
+      }
+      return next();
+    }
     if (!p.startsWith('/api/')) return next();
     if (PUBLIC_PREFIXES.some((x) => p.startsWith(x)) || SELF_SERVICE.some((x) => p.startsWith(x))) return next();
     const auth = req.headers['authorization'];
@@ -98,4 +125,4 @@ function enforce({ pool, jwt, secret, cache }) {
   return mw;
 }
 
-module.exports = { enforce, createRoleCache, PERMISSIONS, ROLE_CAN_WRITE, PUBLIC_PREFIXES, DENY, MATRIX, OWNED };
+module.exports = { enforce, createRoleCache, PERMISSIONS, ROLE_CAN_WRITE, PUBLIC_PREFIXES, DENY, MATRIX, OWNED, SCOPED, SCOPE_ROLES };

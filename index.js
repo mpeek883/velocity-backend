@@ -1157,9 +1157,17 @@ app.get('/api/admin/schema', authenticateToken, async (req, res) => {
 });
 
 // ====== LEADS + RECRUITER EMAIL SCANNING ======
+// Scoped lists: roles.js sets req.scopeOwner for recruiters and sales so they only see their own records.
+const scopedList = (table) => async (req, res) => {
+  try {
+    const s = req.scopeOwner;
+    const result = s ? await pool.query(`SELECT * FROM ${table} WHERE ${s.column}::text=$1 ORDER BY created_at DESC`, [s.user_id]) : await pool.query(`SELECT * FROM ${table} ORDER BY created_at DESC`);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+};
 app.get('/api/leads', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM leads ORDER BY created_at DESC');
+    const result = req.scopeOwner ? await pool.query('SELECT * FROM leads WHERE assigned_to::text=$1 ORDER BY created_at DESC', [req.scopeOwner.user_id]) : await pool.query('SELECT * FROM leads ORDER BY created_at DESC');
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1442,7 +1450,7 @@ app.post('/api/leads/repair-conversations', authenticateToken, async (req, res) 
       const offer = all.filter((x) => x.direction === 'outbound' && x.kind === 'offer_reply').pop();
       const closeOut = all.find((x) => x.kind === 'close_out');
       const inbound = all.filter((x) => x.direction === 'inbound' && x.kind !== 'outreach').pop();
-      if (!offer || ['opportunity_created', 'ready_to_authorize', 'declined', 'closed_no_response'].includes(lead.workflow_status)) continue;
+      if (!offer || ['opportunity_created', 'ready_to_authorize', 'declined', 'closed_no_response', 'personal_interest'].includes(lead.workflow_status)) continue;
       const missing = leadWorkflow.missingInfo(lead);
       const status = closeOut ? 'closed_no_response' : (missing.length ? 'awaiting_info' : 'replied');
       const fields = { workflow_status: status, reviewed_at: lead.reviewed_at || offer.created_at, replied_at: offer.created_at, follow_up_due_at: closeOut ? null : leadWorkflow.addBusinessDays(new Date(inbound && inbound.created_at > offer.created_at ? inbound.created_at : offer.created_at), leadWorkflow.FOLLOW_UP_BUSINESS_DAYS), missing_info: JSON.stringify(missing.map((m) => m.key)), last_inbound_at: inbound ? inbound.created_at : lead.last_inbound_at };
@@ -1899,14 +1907,7 @@ app.post('/api/ai/chat', authenticateToken, async (req, res) => {
 });
 
 // SUBMISSIONS
-app.get('/api/submissions', authenticateToken, async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM submissions ORDER BY created_at DESC');
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+app.get('/api/submissions', authenticateToken, scopedList('submissions'));
 
 app.post('/api/submissions', authenticateToken, async (req, res) => {
   try {
@@ -1948,14 +1949,7 @@ app.delete('/api/submissions/:id', authenticateToken, async (req, res) => {
 });
 
 // PLACEMENTS
-app.get('/api/placements', authenticateToken, async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM placements ORDER BY created_at DESC');
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+app.get('/api/placements', authenticateToken, scopedList('placements'));
 
 app.post('/api/placements', authenticateToken, async (req, res) => {
   try {
@@ -2338,7 +2332,7 @@ auto = automation.install({
 });
 // Users & roles changes must clear the cached role.
 app.use('/api/users', (req, res, next) => { if (!['GET', 'HEAD'].includes(req.method)) roleGuard.roles.clear(); next(); });
-app.get('/api/roles/matrix', authenticateToken, (req, res) => res.json({ matrix: roles.MATRIX, ownership: process.env.OWNERSHIP_MODE !== 'off', nda_gate: process.env.NDA_GATE !== 'off' }));
+app.get('/api/roles/matrix', authenticateToken, (req, res) => res.json({ matrix: roles.MATRIX, ownership: process.env.OWNERSHIP_MODE !== 'off', nda_gate: process.env.NDA_GATE !== 'off', scoping: process.env.SCOPE_MODE !== 'off', scoped: Object.keys(roles.SCOPED), scoped_roles: roles.SCOPE_ROLES }));
 // SLA watchdog, weekly digest, maintenance, post-placement cadence
 const watchdog = require('./watchdog').install({ pool, events: auto.events, notify: auto.notify, notifyOwners: auto.notifyOwners, sendEmail, isEmailConfigured, matching, roleCache: roleGuard.roles, jwt, jwtSecret: JWT_SECRET, port: PORT, app, authenticateToken, requireAdmin });
 // Candidate outreach from AI matches
@@ -2349,6 +2343,9 @@ auto.registerWorkers({ ...watchdog.workers, ...outreach.workers, ...timesheets.w
 auto.hooks.afterPlacement.push(watchdog.schedulePlacementJobs, timesheets.schedulePlacement);
 auto.hooks.intakeApproved = (job, req) => auto.events.enqueue('outreach.suggest', { job_order_id: job.id, created_by: req.user.id }, { dedupeKey: `outreach.suggest:${job.id}`, maxAttempts: 2 });
 auto.hooks.bootstrap = watchdog.bootstrap;
+// Reply as myself (admin): personal interest reply + tailored resume attachment
+const personal = require('./personal-reply').install({ app, pool, authenticateToken, requireAdmin, sendEmail, textToHtml, leadWorkflow, events: auto.events, extractText, resumeUpload, notifyOwners: auto.notifyOwners });
+leadWorkflow.onPersonalInbound = personal.onPersonalInbound;
 
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });

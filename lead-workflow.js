@@ -226,6 +226,13 @@ async function createOpportunityFromLead(pool, lead, analysis = {}) {
  * Returns { action, lead, opportunity? }.
  */
 async function handleInboundReply(pool, lead, msg, options = {}) {
+  if (lead.workflow_status === 'personal_interest') {
+    // Brad applied for this role himself: log the reply, tell him, and never auto-answer.
+    await logEmail(pool, lead, { direction: 'inbound', kind: 'reply', subject: msg.subject, body: String(msg.text || '').slice(0, 20000), message_id: msg.message_id, from_email: msg.from_email });
+    const current = await setLead(pool, lead.id, { last_inbound_at: new Date() });
+    if (module.exports.onPersonalInbound) { try { await module.exports.onPersonalInbound(current, msg); } catch (e) { console.error('⚠️ personal inbound hook:', e.message); } }
+    return { action: 'personal_reply_received', lead: current };
+  }
   const analysis = await (options.analyze || ((l, m) => analyzeInboundReply(l, m, options)))(lead, msg);
   await logEmail(pool, lead, { direction: 'inbound', kind: 'reply', subject: msg.subject, body: String(msg.text || '').slice(0, 20000), message_id: msg.message_id, from_email: msg.from_email, analysis });
 
@@ -293,5 +300,5 @@ async function processFollowUps(pool, options = {}) {
 module.exports = {
   CRITICAL_FIELDS, missingInfo, addBusinessDays, draftOfferReply, templateOfferReply, analyzeInboundReply,
   closeOutEmail, followUpRequestEmail, sendLeadEmail, handleInboundReply, processFollowUps, createOpportunityFromLead,
-  logEmail, setLead, isAIConfigured, FOLLOW_UP_BUSINESS_DAYS, _setClientForTests, findOrCreateAccount,
+  logEmail, setLead, isAIConfigured, FOLLOW_UP_BUSINESS_DAYS, _setClientForTests, findOrCreateAccount, SIGNATURE,
 };

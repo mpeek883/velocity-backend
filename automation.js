@@ -11,7 +11,7 @@
 const esign = require('./esign');
 const dedupe = require('./dedupe');
 const { Events, parse } = require('./events');
-const EXTRA_SCHEMA = [...require('./watchdog').SCHEMA, ...require('./outreach').SCHEMA, ...require('./timesheets').SCHEMA, ...dedupe.SCHEMA];
+const EXTRA_SCHEMA = [...require('./watchdog').SCHEMA, ...require('./outreach').SCHEMA, ...require('./timesheets').SCHEMA, ...dedupe.SCHEMA, ...require('./personal-reply').SCHEMA];
 
 const APP_URL = (process.env.APP_URL || 'https://velocity-i5hx.onrender.com').replace(/\/$/, '');
 const COMPANY = esign.COMPANY;
