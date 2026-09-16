@@ -18,6 +18,8 @@ const contactsSync = require('./contacts-sync');
 const mailOAuth = require('./mail-oauth');
 const leadAssignment = require('./lead-assignment');
 const matching = require('./matching');
+const posting = require('./posting');
+const APP_URL = (process.env.APP_URL || 'https://velocity-i5hx.onrender.com').replace(/\/$/, '');
 const sourcing = require('./sourcing');
 const workAuth = require('./work-auth');
 const { Events } = require('./events');
@@ -90,7 +92,16 @@ const REQUIRED_COLUMNS = {
 
 // Human-visible record numbers (L-000012 / O-000004 / A-000009) so a lead, its
 // opportunity, and the account can be referenced and cross-checked by eye.
-const RECORD_NUMBERS = { leads: 'lead_no', opportunities: 'opportunity_no', accounts: 'account_no' };
+// Human-visible record numbers. Every record a person has to refer to during
+// the process gets one, so a job order can be traced back to the lead it came
+// from and a candidate followed through submission to placement by number
+// rather than by database id.
+const RECORD_NUMBERS = {
+  leads: 'lead_no', opportunities: 'opportunity_no', accounts: 'account_no',
+  job_orders: 'job_no', candidates: 'candidate_no', submissions: 'submission_no', placements: 'placement_no',
+};
+// The prefix each number is shown with: L-00012, J-00004, C-00131.
+const RECORD_PREFIX = { leads: 'L', opportunities: 'O', accounts: 'A', job_orders: 'J', candidates: 'C', submissions: 'S', placements: 'P' };
 async function assignRecordNumber(table, id) {
   const col = RECORD_NUMBERS[table];
   if (!col) return null;
@@ -106,6 +117,31 @@ async function backfillRecordNumbers() {
     } catch (err) {
       console.error(`⚠️ Record numbering for ${table} failed:`, err.message);
     }
+  }
+}
+
+/**
+ * Job orders created before the lead link existed, or created from an
+ * opportunity rather than from Authorize Search, have no lead_id even though
+ * the chain is recoverable through the opportunity. Fill it in so every job
+ * order can be traced back to the recruiter email it started as.
+ */
+async function backfillJobOrderLeads() {
+  try {
+    const r = await pool.query(`
+      UPDATE job_orders j SET lead_id = o.lead_id
+      FROM opportunities o
+      WHERE j.opportunity_id IS NOT NULL AND j.opportunity_id = o.id::text
+        AND j.lead_id IS NULL AND o.lead_id IS NOT NULL`);
+    // And the reverse: a lead that was authorized but never had the job order
+    // written back onto it.
+    const b = await pool.query(`
+      UPDATE leads l SET job_order_id = j.id::text
+      FROM job_orders j
+      WHERE j.lead_id = l.id::text AND l.job_order_id IS NULL`);
+    if (r.rowCount || b.rowCount) console.log(`Linked ${r.rowCount} job order(s) back to their lead and ${b.rowCount} lead(s) forward to their job order`);
+  } catch (err) {
+    console.error('Job order lead backfill failed:', err.message);
   }
 }
 
@@ -186,6 +222,31 @@ async function widenColumns() {
 async function ensureSchema() {
   const statements = [
     "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'active'",
+    // Record numbers across the whole pipeline (see RECORD_NUMBERS).
+    'ALTER TABLE job_orders ADD COLUMN IF NOT EXISTS job_no INTEGER',
+    'ALTER TABLE candidates ADD COLUMN IF NOT EXISTS candidate_no INTEGER',
+    'ALTER TABLE submissions ADD COLUMN IF NOT EXISTS submission_no INTEGER',
+    'ALTER TABLE placements ADD COLUMN IF NOT EXISTS placement_no INTEGER',
+    // One record and one conversation per position: the mail thread and the
+    // requisition id are what keep later emails on the right lead.
+    'ALTER TABLE leads ADD COLUMN IF NOT EXISTS thread_id VARCHAR(255)',
+    'ALTER TABLE leads ADD COLUMN IF NOT EXISTS req_id VARCHAR(100)',
+    'ALTER TABLE lead_emails ADD COLUMN IF NOT EXISTS thread_id VARCHAR(255)',
+    'CREATE INDEX IF NOT EXISTS idx_leads_thread ON leads (thread_id)',
+    'CREATE INDEX IF NOT EXISTS idx_lead_emails_message ON lead_emails (message_id)',
+    // A reply that needs a person: the draft waits here until it is approved.
+    'ALTER TABLE leads ADD COLUMN IF NOT EXISTS draft_kind VARCHAR(30)',
+    'ALTER TABLE leads ADD COLUMN IF NOT EXISTS draft_subject VARCHAR(500)',
+    'ALTER TABLE leads ADD COLUMN IF NOT EXISTS draft_body TEXT',
+    'ALTER TABLE leads ADD COLUMN IF NOT EXISTS draft_reason TEXT',
+    'ALTER TABLE leads ADD COLUMN IF NOT EXISTS draft_model VARCHAR(100)',
+    'ALTER TABLE leads ADD COLUMN IF NOT EXISTS draft_created_at TIMESTAMP',
+    // Job orders: the postable advert and the requirements it is built from.
+    'ALTER TABLE job_orders ADD COLUMN IF NOT EXISTS nice_to_have_skills TEXT',
+    'ALTER TABLE job_orders ADD COLUMN IF NOT EXISTS work_arrangement VARCHAR(50)',
+    'ALTER TABLE job_orders ADD COLUMN IF NOT EXISTS employment_type VARCHAR(50)',
+    'ALTER TABLE job_orders ADD COLUMN IF NOT EXISTS pay_rate VARCHAR(100)',
+    'ALTER TABLE candidate_matches ADD COLUMN IF NOT EXISTS confidence NUMERIC(4,2)',
     "ALTER TABLE job_orders ADD COLUMN IF NOT EXISTS salary_range VARCHAR(100)",
     "ALTER TABLE submissions ADD COLUMN IF NOT EXISTS notes TEXT",
     "ALTER TABLE placements ADD COLUMN IF NOT EXISTS candidate_id INTEGER REFERENCES candidates(id)",
@@ -412,6 +473,7 @@ async function ensureSchema() {
   await reconcileLinkColumns();
   await widenColumns();
   await backfillRecordNumbers();
+  await backfillJobOrderLeads();
   try {
     const b = await contactsSync.backfillContacts(pool);
     if (b.candidates || b.leads) console.log('👥 Contacts synced:', JSON.stringify(b));
@@ -420,6 +482,9 @@ async function ensureSchema() {
   }
   await logSchemaSummary();
   try { await auto.ensureSchema(); console.log('✅ Automation schema ready'); } catch (err) { console.error('⚠️ Automation schema failed:', err.message); }
+  for (const sql of posting.SCHEMA) {
+    try { await pool.query(sql); } catch (err) { console.error('⚠️ Job posting schema failed:', err.message); }
+  }
 }
 
 
@@ -513,7 +578,14 @@ async function insertRow(table, allowed, body) {
     `INSERT INTO ${table} (${cols.join(', ')}) VALUES (${placeholders}) RETURNING *`,
     vals
   );
-  return result.rows[0];
+  const row = result.rows[0];
+  // Numbering happens here rather than in each route, so a record created by
+  // Authorize Search, an Apollo import or the app itself all come out numbered.
+  if (RECORD_NUMBERS[table]) {
+    try { return (await assignRecordNumber(table, row.id)) || row; }
+    catch (err) { console.error(`Record numbering for ${table} failed:`, err.message); }
+  }
+  return row;
 }
 
 async function updateRow(table, allowed, id, body) {
@@ -542,11 +614,13 @@ function sendDbError(res, err) {
 const CANDIDATE_COLS  = ['name', 'email', 'phone', 'title', 'company', 'location', 'skills', 'source', 'status',
                          'linkedin', 'experience_years', 'work_auth', 'availability', 'availability_date', 'desired_rate', 'desired_salary', 'resume_text', 'notes'];
 const JOB_ORDER_COLS  = ['title', 'company', 'location', 'description', 'salary_min', 'salary_max', 'salary_range', 'status', 'opportunity_id', 'account_id', 'priority', 'target_fill_date', 'required_skills', 'intake_status', 'source_of_truth', 'lead_id', 'created_by',
-                         'source', 'url', 'apollo_job_id', 'apollo_org_id', 'posted_at', 'last_seen_at', 'last_synced_at'];
+                         'source', 'url', 'apollo_job_id', 'apollo_org_id', 'posted_at', 'last_seen_at', 'last_synced_at',
+                         'nice_to_have_skills', 'work_arrangement', 'employment_type', 'pay_rate', 'job_posting'];
 const SUBMISSION_COLS = ['candidate_id', 'job_order_id', 'status', 'notes', 'created_by'];
 const LEAD_COLS       = ['name', 'title', 'company', 'company_address', 'company_website', 'email', 'phone', 'linkedin', 'source', 'status', 'territory', 'score',
                          'job_title', 'job_location', 'job_description', 'rate_or_salary', 'notes',
-                         'end_client', 'employment_type', 'work_arrangement', 'workflow_status', 'email_subject', 'email_from', 'email_body', 'email_received_at'];
+                         'end_client', 'employment_type', 'work_arrangement', 'workflow_status', 'email_subject', 'email_from', 'email_body', 'email_received_at',
+                         'thread_id', 'req_id', 'draft_kind', 'draft_subject', 'draft_body', 'draft_reason', 'draft_model'];
 const OPP_COLS        = ['name', 'account', 'contact', 'contact_email', 'value', 'stage', 'probability', 'close_date', 'type', 'competitor', 'notes', 'forecast_category', 'win_loss_reason',
                          'job_title', 'job_description', 'client_name', 'rate', 'work_location', 'work_arrangement', 'lead_id', 'account_id'];
 const PLACEMENT_COLS  = ['submission_id', 'candidate_id', 'job_order_id', 'start_date', 'end_date', 'fee_amount', 'placement_status', 'created_by', 'initial_end_date', 'bill_rate', 'bill_rate_type', 'client_approver_email', 'consultant_email', 'timesheet_cycle'];
@@ -953,12 +1027,24 @@ app.get('/api/job-orders', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM job_orders ORDER BY created_at DESC');
     const rows = result.rows;
-    // Attach the O-number of the opportunity each job order came from.
-    const ids = [...new Set(rows.map((r) => r.opportunity_id).filter(Boolean).map(String))];
-    if (ids.length) {
-      const opps = await pool.query('SELECT id, opportunity_no, name FROM opportunities WHERE id::text = ANY($1)', [ids]);
-      const byId = new Map(opps.rows.map((o) => [String(o.id), o]));
-      for (const r of rows) { const o = byId.get(String(r.opportunity_id)); if (o) { r.opportunity_no = o.opportunity_no; r.opportunity_name = o.name; } }
+    // A job order on its own says nothing about where the work came from. Show
+    // the chain: the recruiter lead it started as, the opportunity, the client
+    // account, and where the posting has been published.
+    for (const r of rows) {
+      if (!r.lead_id && r.opportunity_id) r._lead_via_opportunity = true;
+    }
+    await attachChain(rows, { opportunity_id: 'opportunities', account_id: 'accounts', lead_id: 'leads' });
+    // A job order created from an opportunity inherits the opportunity's lead.
+    const viaOpp = rows.filter((r) => !r.lead_id && r.opportunity_lead_id);
+    if (viaOpp.length) {
+      for (const r of viaOpp) r.lead_id = r.opportunity_lead_id;
+      await attachChain(viaOpp, { lead_id: 'leads' });
+    }
+    for (const r of rows) {
+      r.opportunity_name = r.opportunity_label ?? r.opportunity_name;
+      r.job_ref = r.job_no == null ? null : `J-${String(r.job_no).padStart(5, '0')}`;
+      r.posted_boards = safeParse(r.posted_boards) || [];
+      r.has_posting = Boolean(r.job_posting && String(r.job_posting).trim());
     }
     res.json(rows);
   } catch (err) {
@@ -1165,20 +1251,118 @@ app.get('/api/admin/schema', authenticateToken, async (req, res) => {
 
 // ====== LEADS + RECRUITER EMAIL SCANNING ======
 // Scoped lists: roles.js sets req.scopeOwner for recruiters and sales so they only see their own records.
-const scopedList = (table) => async (req, res) => {
+/**
+ * Attach the record numbers of everything a row is connected to, so every
+ * screen can show the chain (lead -> opportunity -> account -> job order ->
+ * submission -> placement) without each panel querying for it.
+ *
+ * `links` maps a column on the row to the table it points at, e.g.
+ * { lead_id: 'leads', opportunity_id: 'opportunities' }. Each match adds
+ * `<thing>_no` plus a readable label, for example lead_no and lead_name.
+ */
+const CHAIN_FIELDS = {
+  leads: { no: 'lead_no', label: 'name', extra: ['company', 'job_title', 'email', 'lead_no'] },
+  opportunities: { no: 'opportunity_no', label: 'name', extra: ['stage', 'lead_id', 'account_id'] },
+  accounts: { no: 'account_no', label: 'name', extra: [] },
+  job_orders: { no: 'job_no', label: 'title', extra: ['company', 'status', 'lead_id', 'opportunity_id', 'account_id'] },
+  candidates: { no: 'candidate_no', label: 'name', extra: ['title', 'email'] },
+  submissions: { no: 'submission_no', label: 'status', extra: ['candidate_id', 'job_order_id'] },
+};
+async function attachChain(rows, links) {
+  if (!rows || !rows.length) return rows;
+  for (const [column, table] of Object.entries(links)) {
+    const spec = CHAIN_FIELDS[table];
+    if (!spec) continue;
+    const ids = [...new Set(rows.map((r) => r[column]).filter((v) => v != null && v !== '').map(String))];
+    if (!ids.length) continue;
+    const cols = [...new Set(['id', spec.no, spec.label, ...spec.extra])].join(', ');
+    let found;
+    try { found = await pool.query(`SELECT ${cols} FROM ${table} WHERE id::text = ANY($1)`, [ids]); }
+    catch (err) { console.error(`Chain lookup on ${table} failed:`, err.message); continue; }
+    const byId = new Map(found.rows.map((x) => [String(x.id), x]));
+    const prefix = column.replace(/_id$/, '');
+    for (const row of rows) {
+      const hit = byId.get(String(row[column]));
+      if (!hit) continue;
+      row[`${prefix}_no`] = hit[spec.no];
+      row[`${prefix}_label`] = hit[spec.label];
+      row[`${prefix}_ref`] = hit[spec.no] == null ? null : `${RECORD_PREFIX[table]}-${String(hit[spec.no]).padStart(5, '0')}`;
+      for (const f of spec.extra) if (row[`${prefix}_${f}`] === undefined) row[`${prefix}_${f}`] = hit[f];
+    }
+  }
+  return rows;
+}
+
+const scopedList = (table, links = null) => async (req, res) => {
   try {
     const s = req.scopeOwner;
     const result = s ? await pool.query(`SELECT * FROM ${table} WHERE ${s.column}::text=$1 ORDER BY created_at DESC`, [s.user_id]) : await pool.query(`SELECT * FROM ${table} ORDER BY created_at DESC`);
-    res.json(result.rows);
+    const rows = result.rows;
+    if (links) {
+      await attachChain(rows, links);
+      // Carry the job order's own chain through, so a submission or placement
+      // can be traced all the way back to the lead without another request.
+      const withJob = rows.filter((r) => r.job_order_lead_id || r.job_order_opportunity_id);
+      for (const r of withJob) { r.lead_id = r.lead_id || r.job_order_lead_id; r.opportunity_id = r.opportunity_id || r.job_order_opportunity_id; }
+      if (withJob.length) await attachChain(withJob, { lead_id: 'leads', opportunity_id: 'opportunities' });
+      const prefix = RECORD_PREFIX[table];
+      for (const r of rows) r[`${table.replace(/s$/, '')}_ref`] = r[RECORD_NUMBERS[table]] == null ? null : `${prefix}-${String(r[RECORD_NUMBERS[table]]).padStart(5, '0')}`;
+    }
+    res.json(rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
 };
+
+/** JSON that may or may not be JSON; used for columns holding stored arrays. */
+function safeParse(v) {
+  if (v == null) return null;
+  if (typeof v === 'object') return v;
+  try { return JSON.parse(v); } catch { return null; }
+}
+// A lead is "personal" once somebody here has applied for the role themselves.
+// It is no longer a staffing opportunity and must not sit in the same list or
+// be counted as pipeline, so it is separated by `scope`:
+//   scope=business (default for the Leads list) - everything we are staffing
+//   scope=personal - roles somebody here applied for
+//   scope=all - both, for screens that count everything
+const PERSONAL_LEAD = "(COALESCE(workflow_status,'')='personal_interest' OR COALESCE(status,'')='personal')";
+const scopeClause = (scope) => (scope === 'personal' ? ` AND ${PERSONAL_LEAD}` : scope === 'all' ? '' : ` AND NOT ${PERSONAL_LEAD}`);
+
 app.get('/api/leads', authenticateToken, async (req, res) => {
   try {
-    const result = req.scopeOwner ? await pool.query('SELECT * FROM leads WHERE assigned_to::text=$1 ORDER BY COALESCE(email_received_at, created_at) DESC, created_at DESC', [req.scopeOwner.user_id]) : await pool.query('SELECT * FROM leads ORDER BY COALESCE(email_received_at, created_at) DESC, created_at DESC');
-    res.json(result.rows);
+    const scope = ['personal', 'business', 'all'].includes(String(req.query.scope)) ? String(req.query.scope) : 'all';
+    const order = 'ORDER BY COALESCE(email_received_at, created_at) DESC, created_at DESC';
+    const result = req.scopeOwner
+      ? await pool.query(`SELECT * FROM leads WHERE assigned_to::text=$1${scopeClause(scope)} ${order}`, [req.scopeOwner.user_id])
+      : await pool.query(`SELECT * FROM leads WHERE 1=1${scopeClause(scope)} ${order}`);
+    const rows = result.rows;
+    // The chain forward from the lead, so the Leads screen can show what it
+    // turned into, and the flags the screen sorts and filters on.
+    await attachChain(rows, { opportunity_id: 'opportunities', account_id: 'accounts', job_order_id: 'job_orders' });
+    for (const r of rows) {
+      r.lead_ref = r.lead_no == null ? null : `L-${String(r.lead_no).padStart(5, '0')}`;
+      r.is_personal = r.workflow_status === 'personal_interest' || r.status === 'personal';
+      r.has_draft = Boolean(r.draft_body && String(r.draft_body).trim());
+    }
+    res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+/** Counts for the Leads screen tabs, so each tab can show its own total. */
+app.get('/api/leads/counts', authenticateToken, async (req, res) => {
+  try {
+    const where = req.scopeOwner ? 'WHERE assigned_to::text=$1' : '';
+    const params = req.scopeOwner ? [req.scopeOwner.user_id] : [];
+    const q = await pool.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE NOT ${PERSONAL_LEAD}) AS business,
+        COUNT(*) FILTER (WHERE ${PERSONAL_LEAD}) AS personal,
+        COUNT(*) FILTER (WHERE draft_body IS NOT NULL AND draft_body <> '') AS drafts_awaiting_approval
+      FROM leads ${where}`, params);
+    const r = q.rows[0] || {};
+    res.json({ business: Number(r.business || 0), personal: Number(r.personal || 0), drafts_awaiting_approval: Number(r.drafts_awaiting_approval || 0) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 // After a lead is created (manually or by the scanner): number it, assign it
 // fairly, and mirror the recruiter into Contacts.
@@ -1192,6 +1376,21 @@ async function afterLeadCreated(row, { assignTo } = {}) {
   return lead;
 }
 leadScanner.onLeadCreated = (row) => afterLeadCreated(row);
+// A drafted reply is work for a person, so it has to reach one: the lead's
+// owner gets a notification and the Leads screen shows it as "Draft to
+// approve". Nothing was sent to the recruiter.
+leadWorkflow.onDraftParked = async (lead, draft) => {
+  try {
+    await auto.events.record({ type: 'lead.draft_awaiting_approval', entity_type: 'lead', entity_id: lead.id, actor: 'lead-workflow', payload: { kind: draft.draft_kind, reason: draft.draft_reason } });
+    await auto.notifyOwners({
+      owners: lead.assigned_to ? [lead.assigned_to] : [],
+      type: 'lead.draft_awaiting_approval',
+      title: `Reply needs approval: ${lead.name || 'a recruiter'}${lead.job_title ? ` (${lead.job_title})` : ''}`,
+      body: `${draft.draft_reason || 'This reply needs a person.'} A draft is ready on the lead. Nothing has been sent.`,
+      entity_type: 'lead', entity_id: lead.id, link: `${APP_URL}/?lead=${lead.id}`,
+    });
+  } catch (err) { console.error('⚠️ Draft notification failed:', err.message); }
+};
 leadWorkflow.onReadyToAuthorize = (row) => auto.onLeadReadyToAuthorize(row);
 leadScanner.onLeadUpdated = (row) => contactsSync.syncContactFromLead(pool, row).catch(() => {});
 leadWorkflow.onLeadUpdated = (row) => contactsSync.syncContactFromLead(pool, row).catch(() => {});
@@ -1599,6 +1798,73 @@ app.post('/api/leads/:id/inbound', authenticateToken, async (req, res) => {
   }
 });
 
+// ---- Replies that need a person: draft, review, approve, send ----
+// A reply the model judged complex, or one whose position could not be
+// confirmed, is drafted and parked on the lead instead of being sent. The lead
+// shows as "Draft to approve" on the Leads screen until somebody acts on it.
+
+app.get('/api/leads/:id/draft', authenticateToken, async (req, res) => {
+  try {
+    const lead = await loadLead(req.params.id);
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+    if (!lead.draft_body) return res.status(404).json({ error: 'No draft is waiting on this lead', code: 'NO_DRAFT' });
+    res.json({ lead_id: lead.id, kind: lead.draft_kind, subject: lead.draft_subject, body: lead.draft_body, reason: lead.draft_reason, model: lead.draft_model, created_at: lead.draft_created_at });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+/** Approve and send. The reviewer's edits win over the draft as written. */
+app.post('/api/leads/:id/draft/approve', authenticateToken, async (req, res) => {
+  try {
+    const lead = await loadLead(req.params.id);
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+    if (!lead.draft_body) return res.status(409).json({ error: 'There is no draft waiting on this lead', code: 'NO_DRAFT' });
+    const subject = (req.body && req.body.subject) || lead.draft_subject;
+    const body = (req.body && req.body.body) || lead.draft_body;
+    if (!subject || !body) return res.status(400).json({ error: 'subject and body are required' });
+    const kind = lead.draft_kind || 'reply';
+    const missing = leadWorkflow.missingInfo(lead);
+    // The conversation continues where the draft said it would.
+    const workflow = kind === 'close_out' ? 'declined' : (missing.length ? 'awaiting_info' : 'replied');
+    const result = await leadWorkflow.sendLeadEmail(pool, lead, {
+      kind: `approved_${kind}`, subject, body, status: workflow,
+      extra: { missing_info: JSON.stringify(missing.map((m) => m.key)) },
+    });
+    const cleared = await leadWorkflow.clearDraft(pool, result.lead || lead, { status: kind === 'close_out' ? 'unqualified' : 'qualified' });
+    auto.audit('lead.draft_approved', 'lead', lead.id, req, { kind, edited: Boolean(req.body && (req.body.body || req.body.subject)) });
+    res.json({ ok: true, transport: result.transport, lead: cleared || result.lead, missing });
+  } catch (err) { res.status(err.status || 502).json({ error: err.message, code: err.code }); }
+});
+
+/** Throw the draft away and answer by hand (or not at all). */
+app.post('/api/leads/:id/draft/discard', authenticateToken, async (req, res) => {
+  try {
+    const lead = await loadLead(req.params.id);
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+    const status = (req.body && req.body.status) || (lead.workflow_status === 'declined' ? 'unqualified' : 'contacted');
+    const cleared = await leadWorkflow.clearDraft(pool, lead, { status });
+    auto.audit('lead.draft_discarded', 'lead', lead.id, req, { note: (req.body && req.body.note) || null });
+    res.json({ ok: true, lead: cleared });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+/** Write the draft again from the recruiter's last message. */
+app.post('/api/leads/:id/draft/regenerate', authenticateToken, async (req, res) => {
+  try {
+    const lead = await loadLead(req.params.id);
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+    const last = await pool.query("SELECT * FROM lead_emails WHERE lead_id=$1 AND direction='inbound' ORDER BY created_at DESC LIMIT 1", [String(lead.id)]);
+    if (!last.rows.length) return res.status(409).json({ error: 'There is no inbound message on this lead to answer', code: 'NO_INBOUND' });
+    const msg = { subject: last.rows[0].subject, text: last.rows[0].body };
+    const analysis = last.rows[0].analysis ? JSON.parse(last.rows[0].analysis) : {};
+    const drafted = await leadWorkflow.draftReplyToInbound(lead, msg, analysis);
+    const updated = await leadWorkflow.parkDraft(pool, lead, {
+      kind: lead.draft_kind || 'reply', subject: drafted.subject, body: drafted.body,
+      reason: lead.draft_reason || 'Held for approval.', note: drafted.note_for_reviewer, model: drafted.model,
+    });
+    res.json({ ok: true, lead: updated, draft: { subject: drafted.subject, body: drafted.body, model: drafted.model, note_for_reviewer: drafted.note_for_reviewer } });
+  } catch (err) { res.status(err.status || 502).json({ error: err.message }); }
+});
+
 app.post('/api/leads/workflow/run', authenticateToken, async (req, res) => {
   try {
     res.json(await leadWorkflow.processFollowUps(pool, { now: (req.body && req.body.now) ? new Date(req.body.now) : new Date() }));
@@ -1687,6 +1953,89 @@ app.post('/api/opportunities/:id/job-order', authenticateToken, async (req, res)
     auto.audit('job_order.created', 'job_order', row.id, req, { from: 'opportunity', opportunity_id: String(o.id) });
     res.status(201).json({ ...row, opportunity_no: o.opportunity_no, opportunity_name: o.name });
   } catch (err) { sendDbError(res, err); }
+});
+
+// ---- Job postings and publishing to the boards ----
+// This is the step where a role becomes something a candidate can apply to.
+// A job order holds the recruiter's own words, which name the end client and
+// quote the bill rate; `POST .../posting` turns that into a clean advert that
+// is safe to publish, stores it on the job order, and `POST .../publish`
+// records each board it was taken to.
+
+const loadJobOrderRow = async (id) => (await pool.query('SELECT * FROM job_orders WHERE id::text=$1', [String(id)])).rows[0] || null;
+
+app.get('/api/job-boards', authenticateToken, (req, res) => res.json({ boards: posting.BOARDS, ai: posting.isPostingAIConfigured() }));
+
+/** Write (or rewrite) the advert for this job order. */
+app.post('/api/job-orders/:id/posting', authenticateToken, async (req, res) => {
+  try {
+    const job = await loadJobOrderRow(req.params.id);
+    if (!job) return res.status(404).json({ error: 'Job order not found' });
+    if (job.job_posting && !(req.body && req.body.regenerate)) {
+      return res.json({ posting: job.job_posting, model: job.job_posting_model, generated_at: job.job_posting_generated_at, reused: true });
+    }
+    const leadId = job.lead_id || (job.opportunity_id ? (await pool.query('SELECT lead_id FROM opportunities WHERE id::text=$1', [String(job.opportunity_id)])).rows[0]?.lead_id : null);
+    const lead = leadId ? (await pool.query('SELECT * FROM leads WHERE id::text=$1', [String(leadId)])).rows[0] || null : null;
+    const result = await posting.generatePosting(job, lead);
+    const saved = await pool.query(
+      'UPDATE job_orders SET job_posting=$1, job_posting_model=$2, job_posting_generated_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id::text=$3 RETURNING *',
+      [result.posting, result.model, String(job.id)]);
+    auto.audit('job_order.posting_generated', 'job_order', job.id, req, { model: result.model, from_lead: Boolean(lead) });
+    res.json({ posting: result.posting, model: result.model, generated_at: saved.rows[0].job_posting_generated_at, job_order: saved.rows[0], warning: result.error || null });
+  } catch (err) { res.status(err.status || 502).json({ error: err.message }); }
+});
+
+/** Everywhere this job order has been posted. */
+app.get('/api/job-orders/:id/posts', authenticateToken, async (req, res) => {
+  try {
+    const job = await loadJobOrderRow(req.params.id);
+    if (!job) return res.status(404).json({ error: 'Job order not found' });
+    const q = await pool.query('SELECT * FROM job_board_posts WHERE job_order_id=$1 ORDER BY posted_at DESC, id DESC', [String(job.id)]);
+    res.json({ job_order_id: job.id, job_no: job.job_no, posting: job.job_posting || null, boards: posting.BOARDS, posts: q.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+/** Record that the posting was published somewhere. */
+app.post('/api/job-orders/:id/publish', authenticateToken, async (req, res) => {
+  try {
+    const job = await loadJobOrderRow(req.params.id);
+    if (!job) return res.status(404).json({ error: 'Job order not found' });
+    const { board, url = '', notes = '' } = req.body || {};
+    const known = posting.BOARDS.find((b) => b.id === String(board));
+    if (!known) return res.status(400).json({ error: `Unknown board "${board}"`, boards: posting.BOARDS.map((b) => b.id) });
+    const dup = await pool.query("SELECT id FROM job_board_posts WHERE job_order_id=$1 AND board=$2 AND status='posted'", [String(job.id), known.id]);
+    if (dup.rows.length && !(req.body && req.body.allow_duplicate)) {
+      return res.status(409).json({ code: 'ALREADY_POSTED', error: `This job order is already recorded as posted on ${known.name}.`, existing_id: dup.rows[0].id });
+    }
+    const ins = await pool.query(
+      'INSERT INTO job_board_posts (job_order_id, board, board_name, url, notes, posted_by) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
+      [String(job.id), known.id, known.name, url || null, notes || null, String(req.user.id)]);
+    const all = await pool.query("SELECT DISTINCT board_name FROM job_board_posts WHERE job_order_id=$1 AND status='posted'", [String(job.id)]);
+    await pool.query('UPDATE job_orders SET posted_boards=$1, updated_at=CURRENT_TIMESTAMP WHERE id::text=$2', [JSON.stringify(all.rows.map((x) => x.board_name)), String(job.id)]);
+    // Posting a role is the point it becomes open to applicants.
+    if (String(job.status || '') === 'intake_pending') await pool.query("UPDATE job_orders SET status='open' WHERE id::text=$1", [String(job.id)]).catch(() => {});
+    await pool.query('INSERT INTO activities (type, title, account, lead_id, opportunity_id, account_id, status, completed_at, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,CURRENT_TIMESTAMP,$8)',
+      ['Task', `Posted "${job.title}" to ${known.name}`, job.company, job.lead_id || null, job.opportunity_id || null, job.account_id || null, 'completed', String(req.user.id)]).catch(() => {});
+    auto.audit('job_order.published', 'job_order', job.id, req, { board: known.id, url: url || null });
+    res.status(201).json({ ok: true, post: ins.rows[0], posted_boards: all.rows.map((x) => x.board_name) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+/** Close a posting, or correct its link or applicant count. */
+app.put('/api/job-orders/:id/posts/:postId', authenticateToken, async (req, res) => {
+  try {
+    const { url, notes, status, applicants } = req.body || {};
+    const sets = [], vals = [];
+    for (const [col, val] of [['url', url], ['notes', notes], ['status', status], ['applicants', applicants]]) {
+      if (val !== undefined) { vals.push(val); sets.push(`${col}=$${vals.length}`); }
+    }
+    if (status === 'closed') sets.push('closed_at=CURRENT_TIMESTAMP');
+    if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
+    vals.push(String(req.params.postId), String(req.params.id));
+    const q = await pool.query(`UPDATE job_board_posts SET ${sets.join(', ')} WHERE id::text=$${vals.length - 1} AND job_order_id=$${vals.length} RETURNING *`, vals);
+    if (!q.rows.length) return res.status(404).json({ error: 'Posting record not found' });
+    res.json(q.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ---- AI candidate matching ----
@@ -1935,7 +2284,7 @@ app.post('/api/ai/chat', authenticateToken, async (req, res) => {
 });
 
 // SUBMISSIONS
-app.get('/api/submissions', authenticateToken, scopedList('submissions'));
+app.get('/api/submissions', authenticateToken, scopedList('submissions', { candidate_id: 'candidates', job_order_id: 'job_orders' }));
 
 app.post('/api/submissions', authenticateToken, async (req, res) => {
   try {
@@ -1977,7 +2326,7 @@ app.delete('/api/submissions/:id', authenticateToken, async (req, res) => {
 });
 
 // PLACEMENTS
-app.get('/api/placements', authenticateToken, scopedList('placements'));
+app.get('/api/placements', authenticateToken, scopedList('placements', { candidate_id: 'candidates', job_order_id: 'job_orders', submission_id: 'submissions' }));
 
 app.post('/api/placements', authenticateToken, async (req, res) => {
   try {
@@ -2062,7 +2411,8 @@ app.get('/api/analytics', authenticateToken, async (req, res) => {
     const lost = opps.rows.filter((o) => String(o.stage || '').toLowerCase() === 'closed lost');
     const year = new Date().getUTCFullYear();
     const byStage = {}; for (const o of opps.rows) { const k = o.stage || 'Unknown'; byStage[k] = byStage[k] || { stage: k, count: 0, value: 0 }; byStage[k].count += 1; byStage[k].value += num(o.value); }
-    const activeLeads = leads.rows.filter((l) => !['unqualified'].includes(String(l.status || '').toLowerCase()) && !['declined', 'closed_no_response', 'opportunity_created'].includes(String(l.workflow_status || '')));
+    const activeLeads = leads.rows.filter((l) => !['unqualified', 'personal'].includes(String(l.status || '').toLowerCase())
+      && !['declined', 'closed_no_response', 'opportunity_created', 'personal_interest'].includes(String(l.workflow_status || '')));
     const bySource = {}; for (const l of leads.rows) { const k = l.source || 'Unknown'; bySource[k] = (bySource[k] || 0) + 1; }
     const userName = new Map(users.rows.map((u) => [String(u.id), u.name || u.email]));
     const byOwner = {}; for (const l of leads.rows) { const k = l.assigned_to ? (userName.get(String(l.assigned_to)) || `User ${l.assigned_to}`) : 'Unassigned'; byOwner[k] = (byOwner[k] || 0) + 1; }

@@ -8,6 +8,17 @@
 // Critical details we need before an opportunity is created: job title, job
 // description, the client's name, the rate offered, and the work situation
 // (remote / on-site with location / hybrid with location).
+//
+// Automatic replies are deliberately limited. Only a reply the model judges
+// simple - acknowledging details, asking for the few details still missing, or
+// the thank-you close-out when they pass - is sent without a person. Anything
+// that needs judgement (questions about rate or fee, terms, a specific
+// candidate, a concern, or a message that is simply unclear) is drafted and
+// parked for approval: the lead is marked "Draft to approve" and nothing
+// leaves the building until somebody reads it. The same holds when the
+// position a reply belongs to could not be established with confidence.
+// LEAD_AUTO_REPLY=all restores the old send-everything behaviour;
+// LEAD_AUTO_REPLY=off requires approval for every reply.
 
 const Anthropic = require('@anthropic-ai/sdk');
 const { z } = require('zod');
@@ -21,6 +32,10 @@ const FOLLOW_UP_BUSINESS_DAYS = parseInt(process.env.LEAD_FOLLOW_UP_BUSINESS_DAY
 const LEAD_BCC = process.env.LEAD_EMAIL_BCC === undefined ? 'bradpeek@peekitservices.com' : process.env.LEAD_EMAIL_BCC;
 const SIGNATURE = process.env.LEAD_REPLY_SIGNATURE || 'Best regards,\n\nBrad Peek\nManaging Member | Peek Talent Solutions\n301-710-4423\nbradpeek@peekitservices.com\npeekitservices.com';
 const NETWORK_SIZE = process.env.LEAD_NETWORK_SIZE || '5,000+';
+// 'simple' (default): auto-send only straightforward replies. 'all': send
+// everything as before. 'off': every reply waits for approval.
+const AUTO_REPLY = ['all', 'simple', 'off'].includes(String(process.env.LEAD_AUTO_REPLY || '').toLowerCase())
+  ? String(process.env.LEAD_AUTO_REPLY).toLowerCase() : 'simple';
 
 const CRITICAL_FIELDS = [
   { key: 'job_title', label: 'the job title', has: (l) => !!(l.job_title && l.job_title.trim()) },
@@ -123,6 +138,9 @@ async function draftOfferReply(lead, options = {}) {
 
 const ReplyAnalysisSchema = z.object({
   interest: z.enum(['interested', 'not_interested', 'unclear']).describe('Whether the recruiter wants Peek Talent Solutions to help fill the role.'),
+  response_complexity: z.enum(['none', 'simple', 'complex']).describe('What answering this email would take. "none": no answer is needed at all. "simple": the answer is a short acknowledgement, a thank-you, or asking for the specific details still missing - anything a template can say correctly. "complex": answering needs judgement or a commitment - they asked about rates, fees, margins, contract or payment terms, exclusivity, timelines we have not agreed, a named candidate, they pushed back, raised a concern or complaint, asked a question about how we work, or the message is ambiguous enough that a wrong answer would be embarrassing.'),
+  questions: z.array(z.string()).max(5).describe('Questions or requests the recruiter made that an answer would have to address. Empty if none.'),
+  needs_human: z.boolean().describe('True if a person at Peek Talent Solutions should read and approve the answer before it is sent.'),
   provided: z.object({
     job_title: z.string(),
     job_description: z.string(),
@@ -139,11 +157,18 @@ async function analyzeInboundReply(lead, msg, options = {}) {
   const response = await client.messages.parse({
     model: MODEL,
     max_tokens: 2048,
-    system: 'You read a recruiter\'s reply to a staffing firm\'s offer to help fill a role. Decide whether they want the help, and extract any role details they provide. Never invent details.',
+    system: [
+      "You read a recruiter's reply to a staffing firm's offer to help fill a role.",
+      'Decide whether they want the help, extract any role details they provide, and judge what answering would take.',
+      'Be cautious about "simple": if answering would commit the firm to anything, quote a number, or require a judgement call, it is complex and needs a human.',
+      'Never invent details.',
+    ].join(' '),
     output_config: { effort: 'low', format: zodOutputFormat(ReplyAnalysisSchema) },
     messages: [{ role: 'user', content: `Our offer went to ${lead.name} at ${lead.company} about "${lead.job_title || lead.email_subject}".\n\nTheir reply:\nSubject: ${msg.subject}\n\n${String(msg.text || '').slice(0, 10000)}` }],
   });
-  if (response.stop_reason === 'refusal' || !response.parsed_output) return { interest: 'unclear', provided: {}, summary: 'Could not analyze reply' };
+  // A model that could not read the reply must never lead to an automatic
+  // answer, so the safe default is "a person should look at this".
+  if (response.stop_reason === 'refusal' || !response.parsed_output) return { interest: 'unclear', provided: {}, summary: 'Could not analyze reply', response_complexity: 'complex', questions: [], needs_human: true };
   return response.parsed_output;
 }
 
@@ -177,11 +202,104 @@ function followUpRequestEmail(lead, missing) {
   };
 }
 
-async function logEmail(pool, lead, { direction, kind, subject, body, message_id = null, from_email = null, to_email = null, analysis = null }) {
+const DraftReplySchema = z.object({
+  subject: z.string(),
+  body: z.string().describe('Plain text email body. No markdown, no subject line, no signature - the signature is appended when it is sent.'),
+  note_for_reviewer: z.string().describe('One or two sentences telling the person approving this what the recruiter asked and what the draft commits to.'),
+});
+
+/**
+ * Draft an answer to a recruiter's reply for a person to approve. Used when
+ * the answer needs judgement, so the draft is written to be edited: it never
+ * invents a rate, a fee or a term that has not already been agreed.
+ */
+async function draftReplyToInbound(lead, msg, analysis = {}, options = {}) {
+  const missing = missingInfo(lead);
+  const fallback = {
+    subject: replySubject(lead),
+    body: `Hi ${leadFirstName(lead)},\n\nThanks for coming back to me.\n\n[Reply here.]${(analysis.questions || []).length ? `\n\nThey asked:\n${(analysis.questions || []).map((q, i) => `${i + 1}. ${q}`).join('\n')}` : ''}${missing.length ? `\n\nStill needed from them:\n${missing.map((m) => `- ${ASK_LABEL[m.key] || m.label}`).join('\n')}` : ''}`,
+    note_for_reviewer: 'AI was unavailable, so this is a skeleton to write over.',
+    model: 'template',
+  };
+  if (!isAIConfigured() && !options.client) return fallback;
+  const client = options.client || getClient();
+  try {
+    const response = await client.messages.parse({
+      model: MODEL,
+      max_tokens: 2048,
+      system: [
+        'You draft a reply on behalf of Brad Peek, Managing Member of Peek Talent Solutions, an IT staffing firm, to a recruiter who has written back about a role Peek Talent Solutions offered to help fill.',
+        'Write as Brad, first person, plain text, no markdown, no subject line in the body, no signature.',
+        'Answer what they actually asked, in order, and keep it under 200 words.',
+        'You must not invent or agree to anything that is not already in the context: no rate, fee, margin, discount, exclusivity, deadline, headcount or contract term that has not already been stated. Where the answer needs a number or a commitment Brad has not given, write a short bracketed placeholder such as [confirm rate] for him to fill in.',
+        'This draft will be read and approved by a person before it is sent, so it is better to leave a placeholder than to guess.',
+      ].join(' '),
+      output_config: { effort: 'low', format: zodOutputFormat(DraftReplySchema) },
+      messages: [{
+        role: 'user',
+        content: `Draft the reply.\n\n<context>\n${JSON.stringify({
+          recruiter: { name: lead.name, company: lead.company },
+          role_as_understood: { job_title: lead.job_title, end_client: lead.end_client, location: lead.job_location, work_arrangement: lead.work_arrangement, rate: lead.rate_or_salary, employment_type: lead.employment_type },
+          details_still_missing: missing.map((m) => m.label),
+          their_reply: { subject: msg.subject, body: String(msg.text || '').slice(0, 6000) },
+          what_they_asked: analysis.questions || [],
+        }, null, 2)}\n</context>` }],
+    });
+    if (response.stop_reason === 'refusal' || !response.parsed_output) return fallback;
+    return { ...response.parsed_output, subject: replySubject(lead, response.parsed_output.subject), body: response.parsed_output.body.trim(), model: response.model || MODEL };
+  } catch (err) {
+    return { ...fallback, note_for_reviewer: `AI drafting failed (${err.message}); this is a skeleton to write over.` };
+  }
+}
+
+/**
+ * Park a drafted reply against the lead for approval. Nothing is sent. The
+ * lead's visible status becomes "draft_review" so it stands out on the Leads
+ * screen, and `workflow_status` keeps whatever the conversation is really at.
+ */
+async function parkDraft(pool, lead, { kind, subject, body, reason, note = '', workflow_status = null, model = null }) {
+  const fields = {
+    draft_kind: kind,
+    draft_subject: String(subject || '').slice(0, 500),
+    draft_body: body || '',
+    draft_reason: [reason, note].filter(Boolean).join(' '),
+    draft_model: model,
+    draft_created_at: new Date(),
+    status: 'draft_review',
+  };
+  if (workflow_status) fields.workflow_status = workflow_status;
+  const updated = await setLead(pool, lead.id, fields);
+  if (module.exports.onDraftParked) { try { await module.exports.onDraftParked(updated || lead, fields); } catch (e) { console.error('draft notification failed:', e.message); } }
+  return updated;
+}
+
+/** Clear a parked draft once it has been sent or thrown away. */
+async function clearDraft(pool, lead, { status = null } = {}) {
+  return setLead(pool, lead.id, {
+    draft_kind: null, draft_subject: null, draft_body: null, draft_reason: null, draft_model: null, draft_created_at: null,
+    ...(status ? { status } : {}),
+  });
+}
+
+/** Has this exact kind of email already gone out since their last message? */
+async function alreadySentSince(pool, lead, kind, since = null) {
+  const q = await pool.query(
+    `SELECT created_at FROM lead_emails WHERE lead_id=$1 AND direction='outbound' AND kind=$2 ORDER BY created_at DESC LIMIT 1`,
+    [String(lead.id), kind]);
+  if (!q.rows.length) return false;
+  const lastOut = new Date(q.rows[0].created_at).getTime();
+  // `since` is the inbound message before the one being handled. Using the
+  // current one would always look newer than our last send and the guard would
+  // never fire.
+  const mark = since ?? lead.last_inbound_at;
+  return lastOut > (mark ? new Date(mark).getTime() : 0);
+}
+
+async function logEmail(pool, lead, { direction, kind, subject, body, message_id = null, from_email = null, to_email = null, analysis = null, thread_id = null }) {
   const ins = await pool.query(
-    `INSERT INTO lead_emails (lead_id, direction, kind, subject, body, message_id, from_email, to_email, analysis)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-    [String(lead.id), direction, kind, subject, body, message_id, from_email, to_email, analysis ? JSON.stringify(analysis) : null]);
+    `INSERT INTO lead_emails (lead_id, direction, kind, subject, body, message_id, from_email, to_email, analysis, thread_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+    [String(lead.id), direction, kind, subject, body, message_id, from_email, to_email, analysis ? JSON.stringify(analysis) : null, thread_id || lead.thread_id || null]);
   return ins.rows[0];
 }
 
@@ -199,7 +317,7 @@ async function sendLeadEmail(pool, lead, { kind, subject, body, status, extra = 
   // The email always reads as a direct reply: "RE: <their subject>", threaded on their message id where the transport allows it.
   const finalSubject = lead.email_subject ? replySubject(lead, subject) : (/^\s*re:/i.test(subject) ? subject : `RE: ${subject}`);
   const result = await sendEmail({ to: lead.email, bcc: LEAD_BCC || undefined, subject: finalSubject, text: fullBody, html: textToHtml(fullBody), inReplyTo: lead.message_id || undefined, references: lead.message_id || undefined }, options.sendOptions);
-  await logEmail(pool, lead, { direction: 'outbound', kind, subject: finalSubject, body: fullBody, to_email: lead.email, from_email: FROM_EMAIL });
+  await logEmail(pool, lead, { direction: 'outbound', kind, subject: finalSubject, body: fullBody, to_email: lead.email, from_email: FROM_EMAIL, message_id: (result && result.messageId) || null });
   const now = new Date();
   const fields = { workflow_status: status, ...extra };
   // Any outbound communication means the lead has been worked: "new" is only
@@ -269,8 +387,11 @@ async function handleInboundReply(pool, lead, msg, options = {}) {
     if (module.exports.onPersonalInbound) { try { await module.exports.onPersonalInbound(current, msg); } catch (e) { console.error('⚠️ personal inbound hook:', e.message); } }
     return { action: 'personal_reply_received', lead: current };
   }
+  // Captured before this message is recorded, so "have we already answered
+  // since they last wrote" has a stable point to compare against.
+  const priorInbound = lead.last_inbound_at || null;
   const analysis = await (options.analyze || ((l, m) => analyzeInboundReply(l, m, options)))(lead, msg);
-  await logEmail(pool, lead, { direction: 'inbound', kind: 'reply', subject: msg.subject, body: String(msg.text || '').slice(0, 20000), message_id: msg.message_id, from_email: msg.from_email, analysis });
+  await logEmail(pool, lead, { direction: 'inbound', kind: 'reply', subject: msg.subject, body: String(msg.text || '').slice(0, 20000), message_id: msg.message_id, from_email: msg.from_email, analysis, thread_id: msg.thread_id || null });
 
   // Apply any details they supplied.
   const p = analysis.provided || {};
@@ -285,8 +406,36 @@ async function handleInboundReply(pool, lead, msg, options = {}) {
 
   // The recruiter's answer drives the visible lead status: interested ->
   // qualified, not interested -> unqualified, unclear -> stays contacted.
+  // Can this be answered without a person? Only when the position the message
+  // belongs to is certain, the model judged the answer simple, and we have not
+  // already sent that same email since they last wrote - which is what used to
+  // bounce the original reply back at recruiters who followed up.
+  const routing = options.routing || null;
+  const ambiguous = Boolean(routing && routing.confident === false);
+  const complexity = analysis.response_complexity || 'simple';
+  const holdReasons = [
+    ambiguous ? `the position this reply belongs to could not be confirmed (${routing.reason})` : '',
+    complexity === 'complex' ? 'answering this needs judgement, not a template' : '',
+    analysis.needs_human ? 'the reply asks for something a person should confirm' : '',
+    AUTO_REPLY === 'off' ? 'automatic replies are turned off (LEAD_AUTO_REPLY=off)' : '',
+  ].filter(Boolean);
+  const canAutoSend = AUTO_REPLY === 'all' ? true : holdReasons.length === 0;
+  const holdReason = holdReasons.length ? `Held for approval because ${holdReasons.join(', and ')}.` : '';
+
+  const park = async (kind, mail, { workflow_status = null, note = '' } = {}) => {
+    const drafted = await draftReplyToInbound(current, msg, analysis, options);
+    const updated = await parkDraft(pool, current, {
+      kind, subject: drafted.subject || mail.subject, body: drafted.body || mail.body,
+      reason: holdReason || 'Held for approval.', note: [drafted.note_for_reviewer, note].filter(Boolean).join(' '),
+      workflow_status, model: drafted.model,
+    });
+    return { action: 'draft_awaiting_approval', lead: updated, draft_kind: kind, analysis, hold_reasons: holdReasons };
+  };
+
   if (analysis.interest === 'not_interested') {
     const mail = closeOutEmail(current);
+    if (!canAutoSend) return park('close_out', mail, { workflow_status: 'declined', note: 'They are passing on the help; the draft is the thank-you close-out.' });
+    if (await alreadySentSince(pool, current, 'close_out', priorInbound)) return { action: 'close_out_already_sent', lead: current, analysis };
     const r = await sendLeadEmail(pool, current, { kind: 'close_out', ...mail, status: 'declined', extra: { status: 'unqualified' } }, options);
     return { action: 'declined_close_out_sent', lead: r.lead, analysis };
   }
@@ -294,8 +443,30 @@ async function handleInboundReply(pool, lead, msg, options = {}) {
     const missing = missingInfo(current);
     if (missing.length) {
       const mail = followUpRequestEmail(current, missing);
+      if (!canAutoSend) return park('info_request', mail, { workflow_status: 'awaiting_info', note: `Still missing: ${missing.map((m) => m.label).join(', ')}.` });
+      // Never ask twice for the same thing without them answering first.
+      if (await alreadySentSince(pool, current, 'info_request', priorInbound)) {
+        const updated = await setLead(pool, current.id, { missing_info: JSON.stringify(missing.map((m) => m.key)), status: 'qualified' });
+        return { action: 'info_already_requested', lead: updated, missing, analysis };
+      }
       const r = await sendLeadEmail(pool, current, { kind: 'info_request', ...mail, status: 'awaiting_info', extra: { missing_info: JSON.stringify(missing.map((m) => m.key)), status: 'qualified' } }, options);
       return { action: 'info_requested', lead: r.lead, missing, analysis };
+    }
+    // Everything is on file. Two different holds can apply here:
+    //
+    // If we could not establish which position this reply is about, the lead
+    // is NOT advanced - marking the wrong role ready to authorize is exactly
+    // the mix-up this guard exists to prevent. It is parked for a person.
+    if (ambiguous) {
+      return park('reply', { subject: replySubject(current), body: '' }, { note: 'They sound ready to go ahead, but confirm which role this reply is about before authorizing anything.' });
+    }
+    // If the position is certain but the answer needs judgement, the draft is
+    // parked and the lead still moves to the Authorize Search checkpoint.
+    if (!canAutoSend) {
+      await park('reply', { subject: replySubject(current), body: '' }, { note: 'Every critical detail is on file, so this lead is also ready to authorize.' });
+      current = await setLead(pool, current.id, { workflow_status: 'ready_to_authorize', follow_up_due_at: null, missing_info: '[]' });
+      if (module.exports.onReadyToAuthorize) { try { await module.exports.onReadyToAuthorize(current, analysis); } catch (e) { console.error('ready-to-authorize hook failed:', e.message); } }
+      return { action: 'ready_to_authorize_with_draft', lead: current, analysis, hold_reasons: holdReasons };
     }
     if (process.env.LEAD_AUTO_CONVERT === 'true') {
       // Legacy behaviour: convert without a human checkpoint.
@@ -312,7 +483,12 @@ async function handleInboundReply(pool, lead, msg, options = {}) {
     if (module.exports.onLeadUpdated) { try { await module.exports.onLeadUpdated(current); } catch { /* mirror is best-effort */ } }
     return { action: 'ready_to_authorize', lead: current, analysis };
   }
-  // Unclear: keep waiting, but give them another window; the lead stays contacted.
+  // Unclear. If answering would take any judgement, or we could not tell which
+  // position they mean, draft something and let a person decide; otherwise keep
+  // waiting as before and the lead stays contacted.
+  if (!canAutoSend || (analysis.questions || []).length) {
+    return park('reply', { subject: replySubject(current), body: '' }, { note: 'Their reply did not clearly say yes or no.' });
+  }
   current = await setLead(pool, current.id, { follow_up_due_at: addBusinessDays(new Date(), FOLLOW_UP_BUSINESS_DAYS), ...(['new', '', null, undefined].includes(current.status) ? { status: 'contacted' } : {}) });
   return { action: 'unclear_waiting', lead: current, analysis };
 }
@@ -339,4 +515,5 @@ module.exports = {
   CRITICAL_FIELDS, missingInfo, addBusinessDays, draftOfferReply, templateOfferReply, analyzeInboundReply,
   closeOutEmail, followUpRequestEmail, sendLeadEmail, handleInboundReply, processFollowUps, createOpportunityFromLead,
   logEmail, setLead, isAIConfigured, FOLLOW_UP_BUSINESS_DAYS, _setClientForTests, findOrCreateAccount, SIGNATURE, LEAD_BCC, replySubject, nudgeEmail, NUDGE_DAYS,
+  draftReplyToInbound, parkDraft, clearDraft, alreadySentSince, AUTO_REPLY,
 };

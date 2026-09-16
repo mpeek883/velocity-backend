@@ -71,7 +71,7 @@ async function fetchGraphMessages(address, { since, max = 50 } = {}, fetchImpl =
   const url = new URL(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(address)}/mailFolders/inbox/messages`);
   url.searchParams.set('$top', String(Math.min(max, 100)));
   url.searchParams.set('$orderby', 'receivedDateTime desc');
-  url.searchParams.set('$select', 'id,internetMessageId,subject,from,receivedDateTime,body,bodyPreview');
+  url.searchParams.set('$select', 'id,internetMessageId,conversationId,subject,from,receivedDateTime,body,bodyPreview,internetMessageHeaders');
   if (since) url.searchParams.set('$filter', `receivedDateTime ge ${new Date(since).toISOString()}`);
   const resp = await fetchImpl(url.toString(), { headers: { Authorization: `Bearer ${token}`, Prefer: 'outlook.body-content-type="text"' } });
   const data = await resp.json().catch(() => ({}));
@@ -83,7 +83,19 @@ async function fetchGraphMessages(address, { since, max = 50 } = {}, fetchImpl =
     from_email: (m.from && m.from.emailAddress && m.from.emailAddress.address) || '',
     received_at: m.receivedDateTime || null,
     text: (m.body && (m.body.contentType === 'html' ? htmlToText(m.body.content) : m.body.content)) || m.bodyPreview || '',
+    // Threading: what this message is a reply to, so it is filed against the
+    // right position rather than guessed at from the subject line.
+    ...graphThreadHeaders(m),
   }));
+}
+
+/** In-Reply-To / References / conversation id from a Graph message. */
+function graphThreadHeaders(m) {
+  const header = (name) => {
+    const h = (m.internetMessageHeaders || []).find((x) => String(x.name || '').toLowerCase() === name);
+    return h ? h.value : '';
+  };
+  return { in_reply_to: header('in-reply-to'), references: header('references'), thread_id: m.conversationId || null };
 }
 
 async function fetchImapMessages(box, { since, max = 50 } = {}) {
@@ -110,6 +122,9 @@ async function fetchImapMessages(box, { since, max = 50 } = {}) {
           from_email: from.address || '',
           received_at: parsed.date ? parsed.date.toISOString() : null,
           text: parsed.text || htmlToText(parsed.html || ''),
+          in_reply_to: parsed.inReplyTo || '',
+          references: parsed.references || '',
+          thread_id: null,
         });
       }
     } finally {
@@ -191,21 +206,23 @@ async function classifyMessage(msg, options = {}) {
 // ---------------------------------------------------------------------------
 // Lead assembly
 // ---------------------------------------------------------------------------
-/** Normalize a role name / subject for comparison: lowercase, no Re:/Fwd:, no req ids or punctuation. */
-function roleKey(v) {
-  return String(v || '').toLowerCase()
-    .replace(/^(\s*(re|fw|fwd|aw|tr)\s*:\s*)+/g, '')
-    .replace(/\b[a-z]*\d{4,}[a-z0-9-]*\b/g, ' ')   // requisition / job ids
-    .replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim();
-}
-/** Same recruiter request? Titles equal (or one contains the other) or the email subject matches. */
-function sameRole(a, b) {
-  const ta = roleKey(a.job_title), tb = roleKey(b.job_title);
-  if (ta && tb && (ta === tb || ta.includes(tb) || tb.includes(ta))) return true;
-  const sa = roleKey(a.email_subject), sb = roleKey(b.email_subject);
-  if (sa && sb && sa === sb) return true;
-  if (!ta && !tb && !sa && !sb) return true; // nothing to tell them apart
-  return false;
+// Role identity and thread routing live in conversation.js so the rules are
+// testable on their own and shared with the duplicate check.
+const { roleKey, sameRole, roleMatch, reqIds, threadRefs, pickLeadForReply } = require('./conversation');
+
+/**
+ * Every message id we have already filed against a lead, so an inbound reply
+ * can be matched to the conversation it actually belongs to.
+ */
+async function knownMessageIds(pool, leadIds) {
+  const map = new Map();
+  if (!leadIds.length) return map;
+  const ids = leadIds.map(String);
+  const own = await pool.query('SELECT id, message_id FROM leads WHERE id::text = ANY($1)', [ids]);
+  for (const r of own.rows) if (r.message_id) map.set(String(r.message_id).replace(/^<|>$/g, '').toLowerCase(), String(r.id));
+  const mails = await pool.query('SELECT lead_id, message_id FROM lead_emails WHERE lead_id = ANY($1) AND message_id IS NOT NULL', [ids]);
+  for (const r of mails.rows) map.set(String(r.message_id).replace(/^<|>$/g, '').toLowerCase(), String(r.lead_id));
+  return map;
 }
 
 function leadFromExtraction(msg, box, ex) {
@@ -245,13 +262,17 @@ function leadFromExtraction(msg, box, ex) {
     notes: notesParts.join('\n'),
     mailbox: box.address,
     message_id: msg.message_id,
+    // The mailbox conversation and the requisition id are the two keys that
+    // keep every later email about this position on this one record.
+    thread_id: msg.thread_id || null,
+    req_id: reqIds(j.title, msg.subject, j.description).slice(0, 1)[0] || null,
     email_subject: msg.subject,
     email_received_at: msg.received_at || null,
     // The original email, kept verbatim (trimmed) so the lead form can show it.
     email_from: msg.from_name ? `${msg.from_name} <${msg.from_email}>` : msg.from_email,
     email_body: String(msg.text || '').slice(0, 20000),
   };
-  const limits = { name: 250, title: 250, company: 250, company_website: 250, email: 250, phone: 50, linkedin: 250, job_title: 250, job_location: 250, rate_or_salary: 100, end_client: 250, employment_type: 50, work_arrangement: 50, mailbox: 250, message_id: 500, email_subject: 490, email_from: 250 };
+  const limits = { name: 250, title: 250, company: 250, company_website: 250, email: 250, phone: 50, linkedin: 250, job_title: 250, job_location: 250, rate_or_salary: 100, end_client: 250, employment_type: 50, work_arrangement: 50, mailbox: 250, message_id: 500, email_subject: 490, email_from: 250, thread_id: 250, req_id: 100 };
   for (const [k, n] of Object.entries(limits)) if (typeof out[k] === 'string') out[k] = clamp(out[k], n);
   return out;
 }
@@ -260,9 +281,9 @@ function leadFromExtraction(msg, box, ex) {
 async function logOutreach(pool, leadId, lead) {
   try {
     await pool.query(
-      `INSERT INTO lead_emails (lead_id, direction, kind, subject, body, message_id, from_email, to_email)
-       VALUES ($1,'inbound','outreach',$2,$3,$4,$5,$6)`,
-      [String(leadId), lead.email_subject || '', lead.email_body || '', lead.message_id || null, lead.email || null, lead.mailbox || null]);
+      `INSERT INTO lead_emails (lead_id, direction, kind, subject, body, message_id, from_email, to_email, thread_id)
+       VALUES ($1,'inbound','outreach',$2,$3,$4,$5,$6,$7)`,
+      [String(leadId), lead.email_subject || '', lead.email_body || '', lead.message_id || null, lead.email || null, lead.mailbox || null, lead.thread_id || null]);
   } catch { /* logging only */ }
 }
 
@@ -305,22 +326,31 @@ async function scanMailboxes(deps) {
         if (seen.rows.length) { r.already_scanned += 1; continue; }
         summary.messages_scanned += 1;
 
-        // A message from a recruiter we have already written to is a reply
-        // in the offer workflow, not a new lead.
+        // A message from a recruiter we already have a lead for is part of
+        // that conversation, not a new lead. Every lead for this sender is
+        // considered - not only the ones awaiting a reply - so a follow-up
+        // about a role already on file can never open a second record for it.
         const fromEmail = String(msg.from_email || '').toLowerCase();
         if (fromEmail) {
-          const open = await pool.query("SELECT * FROM leads WHERE LOWER(email)=$1 AND workflow_status IN ('replied','awaiting_info') ORDER BY replied_at DESC NULLS LAST, id", [fromEmail]);
-          if (open.rows.length) {
-            // Several roles in play with this recruiter: route the reply to the
-            // lead whose subject / role matches, otherwise the most recent one.
-            const target = open.rows.find((l) => sameRole(l, { job_title: '', email_subject: msg.subject })) || open.rows.find((l) => sameRole(l, { job_title: msg.subject, email_subject: '' })) || open.rows[0];
-            const outcome = await (deps.handleInbound || module.exports.handleInboundReply)(pool, target, msg);
-            r.replies_handled = (r.replies_handled || 0) + 1;
-            summary.replies_handled = (summary.replies_handled || 0) + 1;
-            await pool.query(
-              'INSERT INTO email_scan_log (mailbox, message_id, subject, from_email, received_at, classification, reason, lead_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
-              [box.address, msg.message_id, msg.subject, msg.from_email, msg.received_at || null, 'lead_reply', outcome.action, String(target.id)]);
-            continue;
+          const mine = await pool.query('SELECT * FROM leads WHERE LOWER(email)=$1 ORDER BY created_at, id', [fromEmail]);
+          if (mine.rows.length) {
+            const known = await knownMessageIds(pool, mine.rows.map((l) => l.id));
+            const routed = pickLeadForReply(msg, mine.rows, known);
+            if (routed.lead) {
+              // `confident` false means the position this message belongs to
+              // could not be established. The reply is still filed so nothing
+              // is lost, but handleInboundReply must not answer it on its own.
+              const outcome = await (deps.handleInbound || module.exports.handleInboundReply)(pool, routed.lead, msg, { routing: routed });
+              r.replies_handled = (r.replies_handled || 0) + 1;
+              summary.replies_handled = (summary.replies_handled || 0) + 1;
+              if (!routed.confident) { r.replies_needing_review = (r.replies_needing_review || 0) + 1; summary.replies_needing_review = (summary.replies_needing_review || 0) + 1; }
+              await pool.query(
+                'INSERT INTO email_scan_log (mailbox, message_id, subject, from_email, received_at, classification, reason, lead_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+                [box.address, msg.message_id, msg.subject, msg.from_email, msg.received_at || null, 'lead_reply', `${outcome.action} (matched by ${routed.basis}: ${routed.reason})`, String(routed.lead.id)]);
+              continue;
+            }
+            // No lead of this recruiter's matches, so this is a new position
+            // from someone we already know: fall through and create it.
           }
         }
 
@@ -341,7 +371,9 @@ async function scanMailboxes(deps) {
             // a different role gets a new lead so each request is worked on its
             // own; a follow-up about the same role merges into that lead.
             const siblings = lead.email ? (await pool.query('SELECT * FROM leads WHERE LOWER(email)=$1 ORDER BY id', [lead.email])).rows : [];
-            const cur = siblings.find((l) => sameRole(l, lead)) || null;
+            const sameThread = lead.thread_id ? siblings.find((l) => l.thread_id && String(l.thread_id) === String(lead.thread_id)) : null;
+            const cur = sameThread || siblings.find((l) => roleMatch(l, lead).same) || null;
+            if (cur) reason = `${reason} (merged into L-${cur.lead_no || cur.id}: ${sameThread ? 'same mailbox conversation' : roleMatch(cur, lead).basis})`;
             if (cur) {
               const keep = (fresh, old) => (fresh && String(fresh).trim() ? fresh : (old || null));
               const merged = {
@@ -354,6 +386,7 @@ async function scanMailboxes(deps) {
                 employment_type: keep(lead.employment_type, cur.employment_type), work_arrangement: keep(lead.work_arrangement, cur.work_arrangement),
                 notes: [cur.notes, '---', lead.notes].filter(Boolean).join('\n'),
                 score: Math.max(Number(cur.score) || 0, lead.score),
+                thread_id: cur.thread_id || lead.thread_id, req_id: cur.req_id || lead.req_id,
                 mailbox: lead.mailbox, message_id: lead.message_id, email_subject: lead.email_subject, email_received_at: lead.email_received_at,
                 email_from: lead.email_from, email_body: lead.email_body,
               };
@@ -395,7 +428,8 @@ async function scanMailboxes(deps) {
 }
 
 module.exports = {
-  listMailboxes, publicMailboxes, fetchGraphMessages, fetchImapMessages, prefilter, classifyMessage, leadFromExtraction, scanMailboxes, htmlToText, isLeadAIConfigured, MODEL, _setClientForTests, sameRole, roleKey,
+  listMailboxes, publicMailboxes, fetchGraphMessages, fetchImapMessages, prefilter, classifyMessage, leadFromExtraction, scanMailboxes, htmlToText, isLeadAIConfigured, MODEL, _setClientForTests,
+  sameRole, roleKey, roleMatch, reqIds, threadRefs, pickLeadForReply, knownMessageIds,
   // Reply handling lives in lead-workflow.js; resolved lazily so tests can swap it.
   handleInboundReply: (pool, lead, msg) => require('./lead-workflow').handleInboundReply(pool, lead, msg),
 };

@@ -48,6 +48,8 @@ const OFFER_OR_LATER = ['offer', 'offer_accepted', 'contract_sent', 'contract_si
 const ACCEPTED_OR_LATER = ['offer_accepted', 'contract_sent', 'contract_signed', 'hired'];
 const PLACEMENT_READY = ['offer_accepted', 'contract_sent', 'contract_signed'];
 
+const { roleRequirements } = require('./skills');
+
 const INTAKE_FIELDS = ['title', 'location', 'work_arrangement', 'description', 'required_skills', 'rate', 'rate_type', 'employment_type', 'duration', 'start_date', 'target_fill_date', 'interview_process', 'positions', 'priority', 'notes', 'submitted_by_name', 'submitted_by_email'];
 const CLIENT_ACTIONS = { request_interview: 'Request interview', decline: 'Decline', more_info: 'Request more information', hold: 'Put on hold', select: 'Select for offer' };
 
@@ -302,13 +304,21 @@ function install(deps) {
       { name: 'job_order', run: async (ctx) => {
         const existing = await one('SELECT * FROM job_orders WHERE opportunity_id=$1 ORDER BY id LIMIT 1', [ctx.opportunity.id]);
         if (existing) return { id: String(existing.id), title: existing.title, existing: true };
+        // Requirements are extracted from the recruiter's own words here, so
+        // the job order carries something to match candidates against from the
+        // moment it is created. It previously wrote an empty string into
+        // required_skills, which left candidate matching with nothing to
+        // compare and scored every candidate the same.
+        const req = roleRequirements({ title: lead.job_title, description: lead.job_description || '' });
         const row = await insertRow('job_orders', JOB_ORDER_COLS, {
           title: lead.job_title || 'Staffing request', company: lead.end_client || lead.company || '', location: [lead.work_arrangement, lead.job_location].filter(Boolean).join(' - '),
           description: lead.job_description || '', salary_range: lead.rate_or_salary || '', status: 'intake_pending', priority: body.priority || 'High',
           opportunity_id: ctx.opportunity.id, account_id: ctx.opportunity.account_id, lead_id: String(lead.id), intake_status: 'pending', source_of_truth: 'lead_email', created_by: uid,
-          required_skills: lead.job_description ? '' : '', source: 'Lead',
+          required_skills: req.must.join(', '), nice_to_have_skills: req.nice.join(', '),
+          work_arrangement: lead.work_arrangement || '', employment_type: lead.employment_type || '',
+          source: 'Lead',
         });
-        return { id: String(row.id), title: row.title, existing: false };
+        return { id: String(row.id), title: row.title, job_no: row.job_no, existing: false };
       } },
       { name: 'intake_link', run: async (ctx) => {
         const token = Events.token(24);
@@ -378,6 +388,15 @@ function install(deps) {
     if (d.location || d.work_arrangement) sets.location = [d.work_arrangement, d.location].filter(Boolean).join(' - ');
     if (d.description) sets.description = d.description + (d.interview_process ? `\n\nInterview process: ${d.interview_process}` : '') + (d.duration ? `\nDuration: ${d.duration}` : '') + (d.start_date ? `\nStart: ${d.start_date}` : '') + (d.positions ? `\nOpenings: ${d.positions}` : '') + (d.employment_type ? `\nEmployment type: ${d.employment_type}` : '') + (d.notes ? `\nClient notes: ${d.notes}` : '');
     if (d.required_skills) sets.required_skills = d.required_skills;
+    // The client's own description is the best source of requirements there
+    // is, so re-read it whenever intake is approved.
+    if (d.description) {
+      const req = roleRequirements({ title: d.title || job.title, description: d.description, required_skills: d.required_skills || job.required_skills });
+      if (req.must.length) sets.required_skills = req.must.join(', ');
+      if (req.nice.length) sets.nice_to_have_skills = req.nice.join(', ');
+    }
+    if (d.work_arrangement) sets.work_arrangement = d.work_arrangement;
+    if (d.employment_type) sets.employment_type = d.employment_type;
     if (d.rate) sets.salary_range = d.rate_type ? `${d.rate} ${d.rate_type}` : d.rate;
     if (d.priority) sets.priority = d.priority;
     if (d.target_fill_date) sets.target_fill_date = d.target_fill_date;

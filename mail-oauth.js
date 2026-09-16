@@ -179,9 +179,19 @@ async function fetchGmailMessages(pool, conn, { since, max = 50 } = {}, fetchImp
       from_email: (fm ? fm[2] : from).trim().toLowerCase(),
       received_at: m.internalDate ? new Date(Number(m.internalDate)).toISOString() : null,
       text: gmailBodyText(m.payload) || m.snippet || '',
+      // Threading, so a reply is filed against the position it belongs to.
+      in_reply_to: (h('In-Reply-To') || {}).value || '',
+      references: (h('References') || {}).value || '',
+      thread_id: m.threadId || null,
     });
   }
   return out;
+}
+
+/** One RFC 5322 header from a Graph message, lowercased name. */
+function outlookHeader(m, name) {
+  const h = (m.internetMessageHeaders || []).find((x) => String(x.name || '').toLowerCase() === name);
+  return h ? h.value : '';
 }
 
 /** Graph (delegated): the connected user's own inbox. */
@@ -190,7 +200,7 @@ async function fetchOutlookMessages(pool, conn, { since, max = 50 } = {}, fetchI
   const out = []; let url = new URL('https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages');
   url.searchParams.set('$top', String(Math.min(max, 100)));
   url.searchParams.set('$orderby', 'receivedDateTime desc');
-  url.searchParams.set('$select', 'id,internetMessageId,subject,from,receivedDateTime,body,bodyPreview');
+  url.searchParams.set('$select', 'id,internetMessageId,conversationId,subject,from,receivedDateTime,body,bodyPreview,internetMessageHeaders');
   if (since) url.searchParams.set('$filter', `receivedDateTime ge ${new Date(since).toISOString()}`);
   url = url.toString();
   while (url && out.length < max) {
@@ -204,6 +214,9 @@ async function fetchOutlookMessages(pool, conn, { since, max = 50 } = {}, fetchI
         from_email: ((m.from && m.from.emailAddress && m.from.emailAddress.address) || '').toLowerCase(),
         received_at: m.receivedDateTime || null,
         text: (m.body && (m.body.contentType === 'html' ? htmlToText(m.body.content) : m.body.content)) || m.bodyPreview || '',
+        in_reply_to: outlookHeader(m, 'in-reply-to'),
+        references: outlookHeader(m, 'references'),
+        thread_id: m.conversationId || null,
       });
     }
     url = data['@odata.nextLink'] || null;

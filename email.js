@@ -49,7 +49,7 @@ async function getGraphToken(fetchImpl) {
   return graphToken.value;
 }
 
-async function sendViaGraph({ to, bcc, subject, html, attachmentBuffer, attachmentFilename }, fetchImpl) {
+async function sendViaGraph({ to, bcc, subject, html, attachmentBuffer, attachmentFilename, inReplyTo, references }, fetchImpl) {
   const token = await getGraphToken(fetchImpl);
   const message = {
     subject,
@@ -57,6 +57,16 @@ async function sendViaGraph({ to, bcc, subject, html, attachmentBuffer, attachme
     toRecipients: (Array.isArray(to) ? to : [to]).map((address) => ({ emailAddress: { address } })),
     from: { emailAddress: { address: FROM_EMAIL, name: FROM_NAME } },
   };
+  // Thread the reply onto the recruiter's own message, so their client shows
+  // it as a reply and their answer comes back carrying these ids - which is
+  // how the scanner knows which position the answer is about.
+  const bracket = (v) => (String(v).startsWith('<') ? String(v) : `<${v}>`);
+  if (inReplyTo || references) {
+    message.internetMessageHeaders = [
+      ...(inReplyTo ? [{ name: 'In-Reply-To', value: bracket(inReplyTo) }] : []),
+      ...(references ? [{ name: 'References', value: String(references).split(/\s+/).filter(Boolean).map(bracket).join(' ') }] : []),
+    ];
+  }
   if (bcc) message.bccRecipients = (Array.isArray(bcc) ? bcc : [bcc]).filter(Boolean).map((address) => ({ emailAddress: { address } }));
   if (attachmentBuffer && attachmentFilename) {
     message.attachments = [{
